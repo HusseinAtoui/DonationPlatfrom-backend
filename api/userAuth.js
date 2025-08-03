@@ -101,7 +101,7 @@ router.get('/verify', async (req, res) => {
     const authJwt = jwt.sign(
       { id, role: 'user', email },
       JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '2d' }
     );
 
     return res.json({ token: authJwt });
