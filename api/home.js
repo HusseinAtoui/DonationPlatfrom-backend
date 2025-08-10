@@ -30,7 +30,7 @@ const uploadImagesToS3 = async (files) => {
       Key: key,
       Body: file.buffer,
       ContentType: file.mimetype,
-      ACL: 'public-read'
+      
     };
     const result = await s3.upload(params).promise();
     console.log('Uploaded to S3:', result.Location);
@@ -75,7 +75,7 @@ router.post('/posts', authenticateJWT, authorizeRoles('ngo'), upload.array('imag
     if (req.files?.length) imageLinks = await uploadImagesToS3(req.files);
 
     const item = {
-      postId,
+      id: postId,
       ngoId,
       text,
       images: imageLinks,
