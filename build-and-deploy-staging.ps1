@@ -3,10 +3,12 @@ $LambdaName = "my-staging-lambda"         # <- set staging lambda name
 $UseDeploy = $true                        # <- set $false if you don't want to upload
 # ------------------------------------
 
+cd .
 
 
 Write-Host "1) Installing production dependencies..."
-npm ci --production
+npm install --omit=dev
+
 
 Write-Host "2) Creating temporary build folder..."
 $root = Get-Location
@@ -14,10 +16,11 @@ $buildDir = Join-Path $root "lambda_build"
 if (Test-Path $buildDir) { Remove-Item $buildDir -Recurse -Force }
 New-Item -ItemType Directory -Path $buildDir | Out-Null
 
-Write-Host "3) Copying files to build folder (excluding .git, .env, tests)..."
-Get-ChildItem -Path $root -Force | Where-Object { $_.Name -notin @('.git', '.env', 'tests', '.github') } | ForEach-Object {
+Write-Host "3) Copying files to build folder (excluding .git, .env, tests, .github, lambda_build)..."
+Get-ChildItem -Path $root -Force | Where-Object { $_.Name -notin @('.git', '.env', 'tests', '.github', 'lambda_build') } | ForEach-Object {
     Copy-Item -Path $_.FullName -Destination $buildDir -Recurse -Force
 }
+
 
 $zipPath = Join-Path $root "..\backend-function.zip"
 if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
