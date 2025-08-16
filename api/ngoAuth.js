@@ -185,7 +185,7 @@ router.put('/update/:id', authenticateJWT, upload.single('logo'), async (req, re
 
   try {
     const updateFields = {};
-    const allowedFields = ['phone', 'name', 'location', 'inventorySize', 'requiredClothing', 'bio', 'summary'];
+    const allowedFields = ['phone', 'inventorySize', 'requiredClothing', 'bio', 'summary'];
 
     // collect allowed fields
     for (let field of allowedFields) {
