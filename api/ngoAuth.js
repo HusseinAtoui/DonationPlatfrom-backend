@@ -174,4 +174,85 @@ router.get('/me', authenticateJWT, async (req, res) => {
   }
 });
 
+//Update NGO
+router.put('/update/:id', authenticateJWT, upload.single('logo'), async (req, res) => {
+  const ngoId = req.params.id;
+
+  // role and NGO checks
+  if (req.user.role !== 'ngo' || req.user.id !== ngoId) {
+    return res.status(403).json({ error: 'Forbidden. You can only update your own NGO.' });
+  }
+
+  try {
+    const updateFields = {};
+    const allowedFields = ['phone', 'name', 'location', 'inventorySize', 'requiredClothing', 'bio', 'summary'];
+
+    // collect allowed fields
+    for (let field of allowedFields) {
+      if (req.body[field] !== undefined) {
+        updateFields[field] = req.body[field];
+      }
+    }
+
+    // handle logo upload if provided
+    if (req.file) {
+      const key = `logos/${uuidv4()}-${req.file.originalname}`;
+      const params = {
+        Bucket: LOGOS_BUCKET,
+        Key: key,
+        Body: req.file.buffer,
+        ContentType: req.file.mimetype,
+        ACL: 'public-read'
+      };
+      const uploadResult = await s3.upload(params).promise();
+      updateFields.logoUrl = uploadResult.Location;
+    }
+
+    // build update expression
+    const updateExp = [];
+    const expAttrVals = {};
+    for (let [k, v] of Object.entries(updateFields)) {
+      updateExp.push(`${k} = :${k}`);
+      expAttrVals[`:${k}`] = v;
+    }
+
+    if (updateExp.length === 0) {
+      return res.status(400).json({ error: 'No valid fields provided for update.' });
+    }
+
+    await ddb.update({
+      TableName: NGO_TABLE,
+      Key: { email: req.user.email }, // email is the PK
+      UpdateExpression: 'SET ' + updateExp.join(', '),
+      ExpressionAttributeValues: expAttrVals
+    }).promise();
+
+    res.json({ status: 'updated' });
+  } catch (err) {
+    console.error('Error updating NGO:', err);
+    res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+router.delete('/delete/:id', authenticateJWT, async (req, res) => {
+  const ngoId = req.params.id;
+
+  // role and NGO checks
+  if (req.user.role !== 'ngo' || req.user.id !== ngoId) {
+    return res.status(403).json({ error: 'Forbidden. You can only delete your own NGO.' });
+  }
+
+  try {
+    await ddb.delete({
+      TableName: NGO_TABLE,
+      Key: { email: req.user.email }
+    }).promise();
+
+    res.json({ status: 'deleted' });
+  } catch (err) {
+    console.error('Error deleting NGO:', err);
+    res.status(500).json({ error: 'Server error.' });
+  }
+});
+
 module.exports = router;
