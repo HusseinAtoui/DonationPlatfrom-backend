@@ -17,19 +17,20 @@ AWS.config.update({
   secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
 });
 const ddb = new AWS.DynamoDB.DocumentClient();
-const USER_TABLE = process.env.USER_TABLE;
+
+const USER_TABLE = process.env.USER_TABLE;      // e.g. 'donors'
 const JWT_SECRET = process.env.JWT_SECRET;
 
+// Mailer — keep same pattern as NGO
 const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: { user: process.env.EMAIL_RECEIVER, pass: process.env.EMAIL_PASS }
 });
 
-// Create User
-
 // Create User (issue a JWT for email verification)
 router.post('/create', async (req, res) => {
   const { email, phone, name, location, avatarUrl, bio, password } = req.body;
+
   if (!email || !phone || !name || !password)
     return res.status(400).json({ error: 'Missing required fields.' });
 
@@ -56,17 +57,13 @@ router.post('/create', async (req, res) => {
     // 3) write to DynamoDB
     await ddb.put({ TableName: USER_TABLE, Item: newUser }).promise();
 
-    // 4) create a JWT that expires quickly (e.g. 1h)
-    const verificationJwt = jwt.sign(
-      { id, email },
-      JWT_SECRET,
-      { expiresIn: '1h' }
-    );
+    // 4) create a short-lived JWT (1h)
+    const verificationJwt = jwt.sign({ id, email }, JWT_SECRET, { expiresIn: '1h' });
 
-    // 5) send the verification link
-    const link = `${process.env.API_URL}/user/verify?token=${verificationJwt}`;
+    // 5) send the verification link (NOTE: '/api/user/verify' to match your mount)
+    const link = `${process.env.API_URL}/api/user/verify?token=${verificationJwt}`;
     await transporter.sendMail({
-      from: process.env.EMAIL_USER,
+      from: process.env.EMAIL_RECEIVER,   // match transporter user
       to: email,
       subject: 'Verify Your Account',
       text: `Click to verify your email: ${link}`
@@ -74,7 +71,7 @@ router.post('/create', async (req, res) => {
 
     return res.status(201).json({ status: 'accepted' });
   } catch (err) {
-    console.error(err);
+    console.error('[user/create] Error:', err);
     return res.status(500).json({ error: 'Server error.' });
   }
 });
@@ -85,11 +82,9 @@ router.get('/verify', async (req, res) => {
   if (!token) return res.status(400).json({ error: 'Token required.' });
 
   try {
-    // 1) verify & decode the short‑lived JWT
     const decoded = jwt.verify(token, JWT_SECRET);
     const { id, email } = decoded;
 
-    // 2) update DynamoDB to mark user verified
     await ddb.update({
       TableName: USER_TABLE,
       Key: { email },
@@ -97,32 +92,37 @@ router.get('/verify', async (req, res) => {
       ExpressionAttributeValues: { ':v': true }
     }).promise();
 
-    // 3) issue the regular 7‑day auth JWT
-    const authJwt = jwt.sign(
-      { id, role: 'user', email },
-      JWT_SECRET,
-      { expiresIn: '2d' }
-    );
+    // issue regular auth JWT (2d)
+    const authJwt = jwt.sign({ id, role: 'user', email }, JWT_SECRET, { expiresIn: '2d' });
 
     return res.json({ token: authJwt });
   } catch (err) {
-    console.error(err);
+    console.error('[user/verify] Error:', err);
     return res.status(400).json({ error: 'Invalid or expired token.' });
   }
 });
 
-// Login User
+// Login User (same pattern as NGO — keep query logic)
 router.post('/login', async (req, res) => {
   const { identifier, password } = req.body;
   if (!identifier || !password) return res.status(400).json({ error: 'Missing fields.' });
 
   try {
     const params = identifier.includes('@')
-      ? { TableName: USER_TABLE, KeyConditionExpression: 'email = :id', ExpressionAttributeValues: { ':id': identifier } }
-      : { TableName: USER_TABLE, IndexName: 'phone-index', KeyConditionExpression: 'phone = :id', ExpressionAttributeValues: { ':id': identifier } };
+      ? {
+          TableName: USER_TABLE,
+          KeyConditionExpression: 'email = :id',
+          ExpressionAttributeValues: { ':id': identifier }
+        }
+      : {
+          TableName: USER_TABLE,
+          IndexName: 'phone-index',
+          KeyConditionExpression: 'phone = :id',
+          ExpressionAttributeValues: { ':id': identifier }
+        };
 
     const { Items } = await ddb.query(params).promise();
-    if (!Items.length) return res.status(401).json({ error: 'Invalid credentials.' });
+    if (!Items || !Items.length) return res.status(401).json({ error: 'Invalid credentials.' });
 
     const user = Items[0];
     if (!user.verified) return res.status(401).json({ error: 'Email not verified.' });
@@ -138,7 +138,7 @@ router.post('/login', async (req, res) => {
 
     res.json({ token: jwtTok });
   } catch (err) {
-    console.error(err);
+    console.error('[user/login] Error:', err);
     res.status(500).json({ error: 'Server error.' });
   }
 });
@@ -151,7 +151,7 @@ router.get('/me', authenticateJWT, async (req, res) => {
     if (!Item) return res.status(404).json({ error: 'User not found.' });
     res.json({ profile: Item });
   } catch (err) {
-    console.error(err);
+    console.error('[user/me] Error:', err);
     res.status(500).json({ error: 'Server error.' });
   }
 });

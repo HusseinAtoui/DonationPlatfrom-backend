@@ -59,7 +59,7 @@ router.post('/create', upload.single('logo'), async (req, res) => {
         Key: key,
         Body: req.file.buffer,
         ContentType: req.file.mimetype,
-        ACL: 'public-read'
+
       };
       const uploadResult = await s3.upload(params).promise();
       logoUrl = uploadResult.Location;
@@ -110,7 +110,6 @@ router.post('/create', upload.single('logo'), async (req, res) => {
     res.status(500).json({ error: 'Server error.' });
   }
 });
-
 // Verify NGO
 router.get('/verify', async (req, res) => {
   const token = req.query.token;
@@ -119,49 +118,75 @@ router.get('/verify', async (req, res) => {
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     const { id, email } = decoded;
+
+    // ⚠️ Adjust Key depending on your DynamoDB PK
+    // If PK = email, use { email }
+    // If PK = id, use { id }
     await ddb.update({
       TableName: NGO_TABLE,
-      Key: { email },
+      Key: { email }, // change to { id } if your PK is `id`
       UpdateExpression: 'SET verified = :v',
       ExpressionAttributeValues: { ':v': true }
     }).promise();
 
-    const authToken = jwt.sign({ id, role: 'ngo', email }, JWT_SECRET, { expiresIn: '2d' });
-    res.json({ token: authToken, ngo: { id, email, role: 'ngo', name: decoded.name || null } });
+    return res.redirect(`${FRONTEND_URL}/login?verified=1`);
   } catch (err) {
     console.error('Error verifying token:', err);
     return res.status(400).json({ error: 'Invalid or expired token.' });
   }
 });
 
-// Login NGO
+// ------------------ Login NGO ------------------
 router.post('/login', async (req, res) => {
   const { identifier, password } = req.body;
-  if (!identifier || !password) return res.status(400).json({ error: 'Missing fields.' });
+  if (!identifier || !password) {
+    return res.status(400).json({ error: 'Missing fields.' });
+  }
 
   try {
-    const params = identifier.includes('@')
-      ? { TableName: NGO_TABLE, KeyConditionExpression: 'email = :id', ExpressionAttributeValues: { ':id': identifier } }
-      : { TableName: NGO_TABLE, IndexName: 'phone-index', KeyConditionExpression: 'phone = :id', ExpressionAttributeValues: { ':id': identifier } };
+    let ngo = null;
 
-    const { Items } = await ddb.query(params).promise();
-    if (!Items.length) return res.status(401).json({ error: 'Invalid credentials.' });
+    if (identifier.includes('@')) {
+      // email path (try lowercase first, then raw to support legacy)
+      const emailNorm = identifier.trim().toLowerCase();
+      const out1 = await ddb.get({ TableName: NGO_TABLE, Key: { email: emailNorm } }).promise();
+      ngo = out1.Item || null;
 
-    const ngo = Items[0];
+      if (!ngo) {
+        const out2 = await ddb.get({ TableName: NGO_TABLE, Key: { email: identifier.trim() } }).promise();
+        ngo = out2.Item || null;
+      }
+    } else {
+      // phone path via GSI
+      const out = await ddb.query({
+        TableName: NGO_TABLE,
+        IndexName: 'phone-index',
+        KeyConditionExpression: '#p = :id',
+        ExpressionAttributeNames: { '#p': 'phone' },
+        ExpressionAttributeValues: { ':id': identifier }
+      }).promise();
+      ngo = (out.Items && out.Items[0]) || null;
+    }
+
+    if (!ngo) return res.status(401).json({ error: 'Invalid credentials.' });
     if (!ngo.verified) return res.status(401).json({ error: 'Email not verified.' });
 
-    const match = await bcrypt.compare(password, ngo.passwordHash);
+    const match = await bcrypt.compare(password, ngo.passwordHash || '');
     if (!match) return res.status(401).json({ error: 'Invalid credentials.' });
 
-    const jwtToken = jwt.sign({ id: ngo.id, role: 'ngo', email: ngo.email, name: ngo.name }, JWT_SECRET, { expiresIn: '2d' });
-    res.json({ token: jwtToken });
-  } catch (err) {
-    console.error('Error in /login:', err);
-    res.status(500).json({ error: 'Server error.' });
-  }
-});
+    const jwtToken = jwt.sign(
+      { id: ngo.id, role: 'ngo', email: ngo.email, name: ngo.name },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
 
-// Protected profile route
+    return res.json({ token: jwtToken });
+  } catch (err) {
+    console.error('[NGO][LOGIN] ERROR:', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+}); // <-- this was missing in your file
+
 router.get('/me', authenticateJWT, async (req, res) => {
   if (req.user.role !== 'ngo') return res.status(403).json({ error: 'Forbidden.' });
   try {
