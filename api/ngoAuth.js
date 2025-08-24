@@ -95,7 +95,7 @@ router.post('/create', upload.single('logo'), async (req, res) => {
     const verificationJwt = jwt.sign({ id, email }, JWT_SECRET, { expiresIn: '1h' });
 
     // 5) send verification email
-    const link = `${frontendurl}?token=${verificationJwt}`;
+    const link = `?token=${verificationJwt}`;
     console.log('Sending verification email with link:', link);
     await transporter.sendMail({
       from: process.env.EMAIL_USER,
