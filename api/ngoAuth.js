@@ -95,7 +95,7 @@ router.post('/create', upload.single('logo'), async (req, res) => {
     const verificationJwt = jwt.sign({ id, email }, JWT_SECRET, { expiresIn: '1h' });
 
     // 5) send verification email
-    const link = `${process.env.API_URL}/ngo/verify?token=${verificationJwt}`;
+    const link = `${frontendurl}?token=${verificationJwt}`;
     console.log('Sending verification email with link:', link);
     await transporter.sendMail({
       from: process.env.EMAIL_USER,
@@ -110,31 +110,7 @@ router.post('/create', upload.single('logo'), async (req, res) => {
     res.status(500).json({ error: 'Server error.' });
   }
 });
-// Verify NGO
-router.get('/verify', async (req, res) => {
-  const token = req.query.token;
-  if (!token) return res.status(400).json({ error: 'Token required.' });
 
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    const { id, email } = decoded;
-
-    // ⚠️ Adjust Key depending on your DynamoDB PK
-    // If PK = email, use { email }
-    // If PK = id, use { id }
-    await ddb.update({
-      TableName: NGO_TABLE,
-      Key: { email }, // change to { id } if your PK is `id`
-      UpdateExpression: 'SET verified = :v',
-      ExpressionAttributeValues: { ':v': true }
-    }).promise();
-
-    return res.redirect(`${FRONTEND_URL}/login?verified=1`);
-  } catch (err) {
-    console.error('Error verifying token:', err);
-    return res.status(400).json({ error: 'Invalid or expired token.' });
-  }
-});
 
 // ------------------ Login NGO ------------------
 router.post('/login', async (req, res) => {

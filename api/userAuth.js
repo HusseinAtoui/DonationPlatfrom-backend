@@ -76,31 +76,6 @@ router.post('/create', async (req, res) => {
   }
 });
 
-// Verify User (validate JWT, then flip `verified` flag)
-router.get('/verify', async (req, res) => {
-  const token = req.query.token;
-  if (!token) return res.status(400).json({ error: 'Token required.' });
-
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    const { id, email } = decoded;
-
-    await ddb.update({
-      TableName: USER_TABLE,
-      Key: { email },
-      UpdateExpression: 'SET verified = :v',
-      ExpressionAttributeValues: { ':v': true }
-    }).promise();
-
-    // issue regular auth JWT (2d)
-    const authJwt = jwt.sign({ id, role: 'user', email }, JWT_SECRET, { expiresIn: '2d' });
-
-    return res.json({ token: authJwt });
-  } catch (err) {
-    console.error('[user/verify] Error:', err);
-    return res.status(400).json({ error: 'Invalid or expired token.' });
-  }
-});
 
 // Login User (same pattern as NGO — keep query logic)
 router.post('/login', async (req, res) => {
