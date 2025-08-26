@@ -6,6 +6,7 @@ require('dotenv').config();
 const ngoAuth = require('./api/ngoAuth');
 const userAuth = require('./api/userAuth');
 const home = require('./api/home');
+const map = require('./api/map')
 
 const app = express();
 app.use(cors());               // allow the React dev server
@@ -18,6 +19,7 @@ app.get('/api/health', (req, res) => res.json({ ok: true }));
 app.use('/api/ngo', ngoAuth);
 app.use('/api/user', userAuth);
 app.use('/api/home', home);
+app.use('/api/map', map)
 
 // error handler
 app.use((err, req, res, next) => {
@@ -29,3 +31,4 @@ const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`🚀 API on http://localhost:${PORT}`);
 });
+
