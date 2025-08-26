@@ -10,10 +10,10 @@ AWS.config.update({
 });
 const ddb = new AWS.DynamoDB.DocumentClient();
 const NGO_TABLE = process.env.NGO_TABLE;
-const REQUESTS_TABLE = process.env.REQUEST_TABLE;
+const REQUESTS_TABLE = process.env.REQUESTS_TABLE;
 
 
-// GET /map/ngos?withRequests=true&categories=jackets,shoes
+// GET api/map/ngos?withRequests=true&categories=jackets,shoes
 router.get('/ngos', async (req, res) => {
   const { withRequests, categories } = req.query;
 
@@ -44,10 +44,10 @@ router.get('/ngos', async (req, res) => {
       if (categories !== 'any') {
         const categoryFilter = categories
           .split(',')
-          .map(cat => cat.trim());
+          .map(cat => cat.trim().toLowerCase());
 
         requests = requests.filter(req => {
-          const category = req.clothingCategory?.toLowerCase();
+          const category = req.category?.toLowerCase();
           return categoryFilter.includes(category);
         });
       }
