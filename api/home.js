@@ -313,7 +313,7 @@ router.post(
   async (req, res) => {
     try {
       const { id: ngoId } = req.user;
-      const { category, count, gender, status, dateNeeded, location, size, ageRange } = req.body;
+      const { category, count, gender, status, dateNeeded, location, size, ageRange, coordinates } = req.body;
 
       if (!category || !count || !status || !dateNeeded || !location) {
         return res.status(400).json({ error: 'Missing required fields' });
@@ -337,6 +337,7 @@ router.post(
         fulfilledCount: 0,
         acceptances: [],
         createdAt: new Date().toISOString(),
+        coordinates: coordinates || null,
       };
 
       await ddb.put({ TableName: REQUESTS_TABLE, Item: item }).promise();

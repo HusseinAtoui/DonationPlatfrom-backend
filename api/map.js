@@ -13,54 +13,58 @@ const ddb = new AWS.DynamoDB.DocumentClient();
 const NGO_TABLE = process.env.NGO_TABLE;
 const REQUESTS_TABLE = process.env.REQUESTS_TABLE;
 
-
-// GET api/map/ngos?withRequests=true&categories=jackets,shoes
+/* --------------------------------------------------------------------------
+   GET /map/ngos
+   Returns all NGOs with valid coordinates
+-------------------------------------------------------------------------- */
 router.get('/ngos', async (req, res) => {
-  const { withRequests, categories } = req.query;
-
   try {
     const ngosData = await ddb.scan({ TableName: NGO_TABLE }).promise();
-    let ngos = ngosData.Items;
-
-    // Filter out NGOs with invalid location data
-    ngos = ngos.filter(ngo => {
-      if (
-        ngo.coordinates &&
-        typeof ngo.coordinates.lat === 'number' &&
-        typeof ngo.coordinates.lng === 'number'
-      ) {
-        return true;
-      }
-      return false; // Exclude all other cases
-    });
-
-    if (withRequests === 'true') {
-      if (!categories) {
-        return res.status(400).json({ error: 'Missing "categories" query parameter when withRequests=true' });
-      }
-
-      const requestsData = await ddb.scan({ TableName: REQUESTS_TABLE }).promise();
-      let requests = requestsData.Items;
-
-      if (categories !== 'any') {
-        const categoryFilter = categories
-          .split(',')
-          .map(cat => cat.trim().toLowerCase());
-
-        requests = requests.filter(req => {
-          const category = req.category?.toLowerCase();
-          return categoryFilter.includes(category);
-        });
-      }
-
-      const ngoIdsWithMatchingRequests = new Set(requests.map(r => r.ngoId));
-      ngos = ngos.filter(ngo => ngoIdsWithMatchingRequests.has(ngo.id));
-    }
+    const ngos = (ngosData.Items || []).filter(ngo => 
+      ngo.coordinates &&
+      typeof ngo.coordinates.lat === 'number' &&
+      typeof ngo.coordinates.lng === 'number'
+    );
 
     res.json(ngos);
   } catch (err) {
-    console.error(err);
-    res.sendStatus(500);
+    console.error('[GET /map/ngos]', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+/* --------------------------------------------------------------------------
+   GET /map/requests
+   Returns all requests with valid coordinates
+   Optional query: ?category=jackets,shoes
+-------------------------------------------------------------------------- */
+router.get('/requests', async (req, res) => {
+  const { category } = req.query;
+
+  try {
+    const requestsData = await ddb.scan({ TableName: REQUESTS_TABLE }).promise();
+    let requests = (requestsData.Items || []).filter(req =>
+      req.coordinates &&
+      typeof req.coordinates.lat === 'number' &&
+      typeof req.coordinates.lng === 'number'
+    );
+
+    if (category) {
+      if (category !== 'any') {
+        const categoryFilter = category
+          .split(',')
+          .map(cat => cat.trim().toLowerCase());
+
+        requests = requests.filter(req =>
+          req.category && categoryFilter.includes(req.category.toLowerCase())
+        );
+      }
+    }
+
+    res.json(requests);
+  } catch (err) {
+    console.error('[GET /map/requests]', err);
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
