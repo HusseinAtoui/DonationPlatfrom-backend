@@ -269,7 +269,7 @@ router.post('/create', upload.single('logo'), async (req, res) => {
     const verificationJwt = jwt.sign({ id, email }, JWT_SECRET, { expiresIn: '1h' });
 
     // 5) send verification email
-    const link = `?token=${verificationJwt}`;
+    const link = `${API_URL}/api/ngo/verify?token=${verificationJwt}`;
     console.log('Sending verification email with link:', link);
     await transporter.sendMail({
       from: process.env.EMAIL_RECEIVER,
@@ -284,9 +284,6 @@ router.post('/create', upload.single('logo'), async (req, res) => {
     res.status(500).json({ error: 'Server error.' });
   }
 });
-<<<<<<< Updated upstream
-
-=======
 
 
 // Verify route (responds to GET /api/ngo/verify?token=...)
@@ -310,7 +307,6 @@ router.get('/verify', async (req, res) => {
     return res.status(400).json({ error: 'Invalid or expired token.' });
   }
 });
->>>>>>> Stashed changes
 
 // Verify email change (GET /api/ngo/verify-email-change?token=...)
 router.get('/verify-email-change', async (req, res) => {
