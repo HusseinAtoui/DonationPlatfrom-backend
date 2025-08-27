@@ -86,6 +86,7 @@ function normalizeLocation(inputLocation, lat, lng) {
   return loc;
 }
 
+
 /* ---------------- Google OAuth (NGO) ---------------- */
 router.use(passport.initialize());
 passport.use('ngo-google',
@@ -266,14 +267,10 @@ router.post('/create', upload.single('logo'), async (req, res) => {
     }).promise();
 
     const verificationJwt = jwt.sign({ id, email }, JWT_SECRET, { expiresIn: '1h' });
-<<<<<<< Updated upstream
 
     // 5) send verification email
     const link = `?token=${verificationJwt}`;
     console.log('Sending verification email with link:', link);
-=======
-    const link = `${API_URL}/api/ngo/verify?token=${verificationJwt}`;
->>>>>>> Stashed changes
     await transporter.sendMail({
       from: process.env.EMAIL_RECEIVER,
       to: email,
@@ -441,6 +438,7 @@ router.get('/me', authenticateJWT, async (req, res) => {
     console.error('Error fetching profile:', err);
     res.status(500).json({ error: 'Server error.' });
   }
+  
 });
 
 // Me (patch) — aligns with your frontend PATCH /ngo/me

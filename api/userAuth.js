@@ -105,8 +105,6 @@ router.post('/create', async (req, res) => {
   }
 });
 
-<<<<<<< Updated upstream
-=======
 // ----------------------------------------------------------------------------
 // Verify email from signup
 // ----------------------------------------------------------------------------
@@ -134,7 +132,6 @@ router.get('/verify', async (req, res) => {
     return res.status(400).json({ error: 'Invalid or expired token.' });
   }
 });
->>>>>>> Stashed changes
 
 // ----------------------------------------------------------------------------
 // Login (email OR phone via phone-index GSI)
