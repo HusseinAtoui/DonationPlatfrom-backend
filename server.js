@@ -6,12 +6,9 @@ require('dotenv').config();
 const ngoAuth = require('./api/ngoAuth');
 const userAuth = require('./api/userAuth');
 const home = require('./api/home');
-<<<<<<< Updated upstream
 const map = require('./api/map')
 
-=======
 const messaging = require('./api/messaging');
->>>>>>> Stashed changes
 const app = express();
 app.use(cors());               // allow the React dev server
 app.use(express.json());
@@ -23,12 +20,9 @@ app.get('/api/health', (req, res) => res.json({ ok: true }));
 app.use('/api/ngo', ngoAuth);
 app.use('/api/user', userAuth);
 app.use('/api/home', home);
-<<<<<<< Updated upstream
 app.use('/api/map', map)
 
-=======
 app.use('/api/messaging', messaging);
->>>>>>> Stashed changes
 // error handler
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);

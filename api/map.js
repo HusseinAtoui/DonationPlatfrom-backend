@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const AWS = require('aws-sdk');
+const { id } = require('zod/v4/locales');
 require('dotenv').config();
 
 AWS.config.update({
@@ -23,13 +24,13 @@ router.get('/ngos', async (req, res) => {
 
     // Filter out NGOs with invalid location data
     ngos = ngos.filter(ngo => {
-      if (ngo.location && typeof ngo.location === 'object' && 
-          ngo.location.coordinates && 
-          typeof ngo.location.coordinates.lat === 'number' &&
-          typeof ngo.location.coordinates.lng === 'number') {
+      if (
+        ngo.coordinates &&
+        typeof ngo.coordinates.lat === 'number' &&
+        typeof ngo.coordinates.lng === 'number'
+      ) {
         return true;
       }
-      
       return false; // Exclude all other cases
     });
 
