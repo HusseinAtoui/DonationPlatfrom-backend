@@ -144,6 +144,100 @@ passport.use('ngo-google',
     }
   )
 );
+/* ---------------- cascade delete helpers ---------------- */
+
+function extractS3KeyFromUrl(url) {
+  if (!url) return null;
+  try {
+    const u = new URL(url);
+    // Handles virtual-hosted or path-style: /folder/key...
+    return decodeURIComponent(u.pathname.replace(/^\/+/, ''));
+  } catch {
+    return null;
+  }
+}
+
+async function deleteS3Keys(keys) {
+  if (!keys?.length) return;
+  // Chunk by 1000 (S3 limit per request)
+  for (let i = 0; i < keys.length; i += 1000) {
+    const chunk = keys.slice(i, i + 1000);
+    try {
+      await s3.deleteObjects({
+        Bucket: LOGOS_BUCKET,
+        Delete: { Objects: chunk.map(Key => ({ Key })) }
+      }).promise();
+    } catch (e) {
+      console.error('[NGO CASCADE] S3 deleteObjects error:', e);
+    }
+  }
+}
+
+async function batchDelete(table, pkName, ids) {
+  if (!table || !ids?.length) return;
+  // DynamoDB batchWrite limit: 25 items
+  for (let i = 0; i < ids.length; i += 25) {
+    const chunk = ids.slice(i, i + 25);
+    const RequestItems = {
+      [table]: chunk.map(val => ({ DeleteRequest: { Key: { [pkName]: val } } }))
+    };
+    try {
+      await ddb.batchWrite({ RequestItems }).promise();
+    } catch (e) {
+      console.error(`[NGO CASCADE] batchWrite delete failed for ${table}:`, e);
+    }
+  }
+}
+
+async function scanAllByNgoId(table, ngoId) {
+  const items = [];
+  if (!table) return items;
+  let ExclusiveStartKey;
+  do {
+    const page = await ddb.scan({
+      TableName: table,
+      FilterExpression: '#n = :ngo',
+      ExpressionAttributeNames: { '#n': 'ngoId' },
+      ExpressionAttributeValues: { ':ngo': ngoId },
+      ExclusiveStartKey
+    }).promise();
+    items.push(...(page.Items || []));
+    ExclusiveStartKey = page.LastEvaluatedKey;
+  } while (ExclusiveStartKey);
+  return items;
+}
+
+/**
+ * Deletes all Posts & Requests for an NGO and related S3 media (post images + logo).
+ * Call this BEFORE deleting the NGO item.
+ */
+async function cascadeDeleteNgoResources({ ngoId, ngoEmail }) {
+  try {
+    // 1) Collect items
+    const [posts, requests, ngoRow] = await Promise.all([
+      scanAllByNgoId(POSTS_TABLE, ngoId),
+      scanAllByNgoId(REQUESTS_TABLE, ngoId),
+      ddb.get({ TableName: NGO_TABLE, Key: { email: (ngoEmail || '').toLowerCase() } }).promise()
+        .then(r => r.Item).catch(() => null)
+    ]);
+
+    // 2) Delete Dynamo rows
+    await batchDelete(POSTS_TABLE,    POSTS_PK,    posts.map(p => p[POSTS_PK]).filter(Boolean));
+    await batchDelete(REQUESTS_TABLE, REQUESTS_PK, requests.map(r => r[REQUESTS_PK]).filter(Boolean));
+
+    // 3) Delete S3 media (post images + NGO logo)
+    const imageUrls = posts.flatMap(p => Array.isArray(p.images) ? p.images : []);
+    const imageKeys = imageUrls.map(extractS3KeyFromUrl).filter(Boolean);
+
+    const logoKey = extractS3KeyFromUrl(ngoRow?.logoUrl);
+    const allKeys = [...imageKeys, ...(logoKey ? [logoKey] : [])];
+
+    await deleteS3Keys(allKeys);
+  } catch (e) {
+    // We log but do not block the account deletion
+    console.error('[NGO CASCADE] Failed to fully cascade delete:', e);
+  }
+}
 
 // Kick off Google OAuth
 router.get('/auth/google',
@@ -602,8 +696,6 @@ router.put('/update/:id', authenticateJWT, upload.single('logo'), async (req, re
     res.status(500).json({ error: 'Server error.' });
   }
 });
-
-// Delete (legacy route)
 router.delete('/delete/:id', authenticateJWT, async (req, res) => {
   const ngoId = req.params.id;
   if (req.user.role !== 'ngo' || req.user.id !== ngoId) {
@@ -611,6 +703,10 @@ router.delete('/delete/:id', authenticateJWT, async (req, res) => {
   }
 
   try {
+    // Cascade delete posts, requests, and S3 media
+    await cascadeDeleteNgoResources({ ngoId: req.user.id, ngoEmail: req.user.email });
+
+    // Delete the NGO record itself (PK is email)
     await ddb.delete({
       TableName: NGO_TABLE,
       Key: { email: (req.user.email || '').toLowerCase() }
@@ -623,11 +719,14 @@ router.delete('/delete/:id', authenticateJWT, async (req, res) => {
   }
 });
 
-// Delete — new endpoint to match frontend: DELETE /api/ngo/me
 router.delete('/me', authenticateJWT, async (req, res) => {
   if (req.user.role !== 'ngo') return res.status(403).json({ error: 'Forbidden.' });
 
   try {
+    // Cascade delete posts, requests, and S3 media
+    await cascadeDeleteNgoResources({ ngoId: req.user.id, ngoEmail: req.user.email });
+
+    // Delete the NGO record itself
     await ddb.delete({
       TableName: NGO_TABLE,
       Key: { email: (req.user.email || '').toLowerCase() }
