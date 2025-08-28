@@ -1,3 +1,4 @@
+
 // api/ngoAuth.js
 const express = require('express');
 const router = express.Router();
@@ -67,26 +68,6 @@ async function sendEmailChangeVerification(id, oldEmail, newEmail) {
   });
 }
 
-// normalize incoming location + optional lat/lng into the consistent map-friendly shape
-function normalizeLocation(inputLocation, lat, lng) {
-  const address =
-    typeof inputLocation === 'string'
-      ? inputLocation.trim()
-      : (inputLocation && inputLocation.address) || '';
-
-  const latNum = lat !== undefined ? Number(lat) : undefined;
-  const lngNum = lng !== undefined ? Number(lng) : undefined;
-
-  const hasNumbers = Number.isFinite(latNum) && Number.isFinite(lngNum);
-
-  const loc = { address };
-  if (hasNumbers) {
-    loc.coordinates = { lat: latNum, lng: lngNum };
-  }
-  return loc;
-}
-
-
 /* ---------------- Google OAuth (NGO) ---------------- */
 router.use(passport.initialize());
 passport.use('ngo-google',
@@ -113,11 +94,9 @@ passport.use('ngo-google',
             'New NGO';
           const logoUrl = profile.photos?.[0]?.value || '';
 
-          // location with map-friendly shape (no coords from Google here)
-          const location = normalizeLocation('', undefined, undefined);
-
           const item = {
-            id, email, phone: '', name, location,
+            id, email, phone: '', name, location: '',
+            coordinates: {lat: null, lng: null },
             passwordHash: '',
             inventorySize: 0, requiredClothing: '',
             logoUrl, bio: '', summary: '',
@@ -309,7 +288,7 @@ router.get('/ngos', async (_req, res) => {
 router.post('/create', upload.single('logo'), async (req, res) => {
   let {
     email, phone, name, location, password,
-    inventorySize, requiredClothing, bio, summary, lat, lng
+    inventorySize, requiredClothing, bio, summary, coordinates
   } = req.body;
   let { logoUrl } = req.body;
 
@@ -338,12 +317,13 @@ router.post('/create', upload.single('logo'), async (req, res) => {
     const passwordHash = await bcrypt.hash(password, 10);
     const id = uuidv4();
 
-    // Map-friendly location shape; accepts optional lat/lng from client
-    const normalizedLocation = normalizeLocation(location, lat, lng);
-
     const item = {
       id, email, phone, name,
-      location: normalizedLocation,
+      location: (location || '').trim(),
+      coordinates: {
+        lat: coordinates?.lat !== undefined ? Number(coordinates.lat) : null,
+        lng: coordinates?.lng !== undefined ? Number(coordinates.lng) : null
+      },
       passwordHash,
       inventorySize: Number(inventorySize) || 0,
       requiredClothing: requiredClothing || '',
@@ -544,8 +524,7 @@ router.patch('/me', authenticateJWT, async (req, res) => {
       location,       // can be string or object
       summary,        // maps to summary/bio
       logoUrl,
-      lat,
-      lng,
+      coordinates,
     } = req.body;
 
     // 1) Email change -> initiate reverification flow and return 202
@@ -594,21 +573,23 @@ router.patch('/me', authenticateJWT, async (req, res) => {
       updateFields.summary = summary;
       updateFields.bio = summary;
     }
-    if (location !== undefined || lat !== undefined || lng !== undefined) {
+    if (location !== undefined || coordinates !== undefined) {
       const current = await ddb.get({
         TableName: NGO_TABLE,
         Key: { email: currentEmail }
       }).promise();
 
-      const existingLoc = current.Item?.location || {};
-      // build from incoming props; if location is a string, treat as address
-      const newLoc = normalizeLocation(
-        typeof location === 'string' ? location : (location?.address || existingLoc.address || ''),
-        lat !== undefined ? lat : existingLoc?.coordinates?.lat,
-        lng !== undefined ? lng : existingLoc?.coordinates?.lng
-      );
-      updateFields.location = newLoc;
+      const existing = current.Item || {};
+
+      updateFields.location =
+        location !== undefined ? String(location).trim() : existing.location || '';
+
+      updateFields.coordinates = {
+        lat: coordinates?.lat !== undefined ? Number(coordinates.lat) : existing?.coordinates?.lat || null,
+        lng: coordinates?.lng !== undefined ? Number(coordinates.lng) : existing?.coordinates?.lng || null
+      };
     }
+
 
     if (Object.keys(updateFields).length === 0) {
       return res.status(400).json({ error: 'No valid fields provided for update.' });
@@ -719,6 +700,7 @@ router.delete('/delete/:id', authenticateJWT, async (req, res) => {
   }
 });
 
+// Delete — new endpoint to match frontend: DELETE /api/ngo/me
 router.delete('/me', authenticateJWT, async (req, res) => {
   if (req.user.role !== 'ngo') return res.status(403).json({ error: 'Forbidden.' });
 
