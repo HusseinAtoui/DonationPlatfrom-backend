@@ -49,19 +49,30 @@ router.get('/requests', async (req, res) => {
       typeof req.coordinates.lng === 'number'
     );
 
-    if (category) {
-      if (category !== 'any') {
-        const categoryFilter = category
-          .split(',')
-          .map(cat => cat.trim().toLowerCase());
+    if (category && category !== 'any') {
+      const categoryFilter = category
+        .split(',')
+        .map(cat => cat.trim().toLowerCase());
 
-        requests = requests.filter(req =>
-          req.category && categoryFilter.includes(req.category.toLowerCase())
-        );
-      }
+      requests = requests.filter(req =>
+        req.category && categoryFilter.includes(req.category.toLowerCase())
+      );
     }
 
-    res.json(requests);
+    const ngosData = await ddb.scan({ TableName: NGO_TABLE }).promise();
+    const ngos = (ngosData.Items || []).filter(ngo =>
+      ngo.coordinates &&
+      typeof ngo.coordinates.lat === 'number' &&
+      typeof ngo.coordinates.lng === 'number'
+    );
+
+    const requestsWithNgo = requests.map(req => {
+      const ngo = ngos.find(n => n.id === req.ngoId);
+      return { ...req, ngo: ngo || null };
+    });
+
+    res.json(requestsWithNgo);
+
   } catch (err) {
     console.error('[GET /map/requests]', err);
     res.status(500).json({ error: 'Server error' });
