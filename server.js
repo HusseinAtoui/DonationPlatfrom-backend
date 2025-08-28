@@ -21,7 +21,7 @@ app.use('/api/ngo', ngoAuth);
 app.use('/api/user', userAuth);
 app.use('/api/home', home);
 app.use('/map', map)
-
+app.use('/api/messages', messaging);
 // error handler
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);

@@ -370,6 +370,42 @@ async function sendUserVerificationEmail(id, email) {
     text: `Click to verify your email: ${link}`
   });
 }
+// GET /api/user/public/:id  → { id, name, avatarUrl }
+router.get('/public/:id', async (req, res) => {
+  const id = req.params.id;
+  if (!id) return res.status(400).json({ error: 'id required' });
+  try {
+    // Prefer GSI "id-index" (PK = id). If you don't have it yet, we'll fallback to a scan.
+    let user = null;
+    try {
+      const q = await ddb.query({
+        TableName: USER_TABLE,
+        IndexName: 'id-index',                 // create when convenient
+        KeyConditionExpression: 'id = :id',
+        ExpressionAttributeValues: { ':id': id },
+        ProjectionExpression: 'id, name, avatarUrl'
+      }).promise();
+      user = (q.Items || [])[0] || null;
+    } catch (_) {}
+
+    if (!user) {
+      const s = await ddb.scan({
+        TableName: USER_TABLE,
+        FilterExpression: '#i = :id',
+        ExpressionAttributeNames: { '#i': 'id' },
+        ExpressionAttributeValues: { ':id': id },
+        ProjectionExpression: 'id, name, avatarUrl'
+      }).promise();
+      user = (s.Items || [])[0] || null;
+    }
+
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    return res.json({ id: user.id, name: user.name || '', avatarUrl: user.avatarUrl || '' });
+  } catch (err) {
+    console.error('[user/public/:id]', err);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
 
 // ----------------------------------------------------------------------------
 // Google OAuth (user)
@@ -500,30 +536,5 @@ router.get(
   }
 );
 
-
-router.get('/auth/google',
-  passport.authenticate('user-google', { scope: ['profile', 'email'] })
-);
-
-router.get(
-  '/auth/google/callback',
-  passport.authenticate('user-google', { session: false, failureRedirect: `${FRONTEND_URL}/login` }),
-  async (req, res) => {
-    try {
-      const u = req.user;
-      const token = issueAuthToken(u);
-      const userData = sanitizeProfileForClient(u);
-      const userDataString = encodeURIComponent(JSON.stringify(userData));
-
-      const wantsJson = req.query.json === '1' || (req.get('accept') || '').includes('application/json');
-      if (wantsJson) return res.json({ token, user: userData });
-
-      return res.redirect(`${FRONTEND_URL}/login?token=${token}&user=${userDataString}`);
-    } catch (err) {
-      console.error('[user/auth/google/callback] ERROR:', err);
-      return res.status(500).json({ error: 'OAuth error' });
-    }
-  }
-);
 
 module.exports = router;

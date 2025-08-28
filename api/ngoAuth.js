@@ -721,4 +721,39 @@ router.delete('/me', authenticateJWT, async (req, res) => {
   }
 });
 
+// GET /api/ngo/public/:id → { id, name, logoUrl }
+router.get('/public/:id', async (req, res) => {
+  const id = req.params.id;
+  if (!id) return res.status(400).json({ error: 'id required' });
+  try {
+    let ngo = null;
+    try {
+      const q = await ddb.query({
+        TableName: NGO_TABLE,
+        IndexName: 'id-index',                 // add later; we fall back below
+        KeyConditionExpression: 'id = :id',
+        ExpressionAttributeValues: { ':id': id },
+        ProjectionExpression: 'id, name, logoUrl'
+      }).promise();
+      ngo = (q.Items || [])[0] || null;
+    } catch (_) {}
+
+    if (!ngo) {
+      const s = await ddb.scan({
+        TableName: NGO_TABLE,
+        FilterExpression: '#i = :id',
+        ExpressionAttributeNames: { '#i': 'id' },
+        ExpressionAttributeValues: { ':id': id },
+        ProjectionExpression: 'id, name, logoUrl'
+      }).promise();
+      ngo = (s.Items || [])[0] || null;
+    }
+
+    if (!ngo) return res.status(404).json({ error: 'NGO not found' });
+    return res.json({ id: ngo.id, name: ngo.name || '', logoUrl: ngo.logoUrl || '' });
+  } catch (err) {
+    console.error('[ngo/public/:id]', err);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
 module.exports = router;
