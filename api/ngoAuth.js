@@ -719,9 +719,7 @@ router.delete('/me', authenticateJWT, async (req, res) => {
     console.error('Error deleting NGO (me):', err);
     return res.status(500).json({ error: 'Server error.' });
   }
-});
-
-// GET /api/ngo/public/:id → { id, name, logoUrl }
+});// routes/ngo.js (or wherever you mount it under /api/ngo)
 router.get('/public/:id', async (req, res) => {
   const id = req.params.id;
   if (!id) return res.status(400).json({ error: 'id required' });
@@ -730,10 +728,11 @@ router.get('/public/:id', async (req, res) => {
     try {
       const q = await ddb.query({
         TableName: NGO_TABLE,
-        IndexName: 'id-index',                 // add later; we fall back below
+        IndexName: 'id-index',
         KeyConditionExpression: 'id = :id',
         ExpressionAttributeValues: { ':id': id },
-        ProjectionExpression: 'id, name, logoUrl'
+        ProjectionExpression: 'id, #n, logoUrl, avatarUrl',
+        ExpressionAttributeNames: { '#n': 'name' },
       }).promise();
       ngo = (q.Items || [])[0] || null;
     } catch (_) {}
@@ -742,18 +741,25 @@ router.get('/public/:id', async (req, res) => {
       const s = await ddb.scan({
         TableName: NGO_TABLE,
         FilterExpression: '#i = :id',
-        ExpressionAttributeNames: { '#i': 'id' },
+        ExpressionAttributeNames: { '#i': 'id', '#n': 'name' },
         ExpressionAttributeValues: { ':id': id },
-        ProjectionExpression: 'id, name, logoUrl'
+        ProjectionExpression: 'id, #n, logoUrl, avatarUrl',
       }).promise();
       ngo = (s.Items || [])[0] || null;
     }
 
     if (!ngo) return res.status(404).json({ error: 'NGO not found' });
-    return res.json({ id: ngo.id, name: ngo.name || '', logoUrl: ngo.logoUrl || '' });
+    return res.json({
+      id: ngo.id,
+      name: ngo.name || '',
+      logoUrl: ngo.logoUrl || '',
+      avatarUrl: ngo.avatarUrl || '',
+    });
   } catch (err) {
     console.error('[ngo/public/:id]', err);
     return res.status(500).json({ error: 'Server error' });
   }
 });
+
+
 module.exports = router;

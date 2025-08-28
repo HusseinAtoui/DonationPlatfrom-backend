@@ -369,38 +369,49 @@ async function sendUserVerificationEmail(id, email) {
     subject: 'Verify Your Account',
     text: `Click to verify your email: ${link}`
   });
-}
-// GET /api/user/public/:id  → { id, name, avatarUrl }
+}// GET /api/user/public/:id  → { id, name, avatarUrl }
 router.get('/public/:id', async (req, res) => {
   const id = req.params.id;
   if (!id) return res.status(400).json({ error: 'id required' });
+
   try {
-    // Prefer GSI "id-index" (PK = id). If you don't have it yet, we'll fallback to a scan.
     let user = null;
+
+    // Try GSI id-index first (PK = id)
     try {
       const q = await ddb.query({
         TableName: USER_TABLE,
-        IndexName: 'id-index',                 // create when convenient
-        KeyConditionExpression: 'id = :id',
+        IndexName: 'id-index',
+        KeyConditionExpression: '#id = :id',
+        ExpressionAttributeNames: { '#id': 'id', '#n': 'name' },
         ExpressionAttributeValues: { ':id': id },
-        ProjectionExpression: 'id, name, avatarUrl'
+        ProjectionExpression: '#id, #n, avatarUrl, photoUrl, firstName, lastName, displayName',
+        Limit: 1,
       }).promise();
       user = (q.Items || [])[0] || null;
     } catch (_) {}
 
+    // Fallback: table scan if GSI not present
     if (!user) {
       const s = await ddb.scan({
         TableName: USER_TABLE,
-        FilterExpression: '#i = :id',
-        ExpressionAttributeNames: { '#i': 'id' },
+        FilterExpression: '#id = :id',
+        ExpressionAttributeNames: { '#id': 'id', '#n': 'name' },
         ExpressionAttributeValues: { ':id': id },
-        ProjectionExpression: 'id, name, avatarUrl'
+        ProjectionExpression: '#id, #n, avatarUrl, photoUrl, firstName, lastName, displayName',
       }).promise();
       user = (s.Items || [])[0] || null;
     }
 
     if (!user) return res.status(404).json({ error: 'User not found' });
-    return res.json({ id: user.id, name: user.name || '', avatarUrl: user.avatarUrl || '' });
+
+    const name =
+      user.name ||
+      user.displayName ||
+      [user.firstName, user.lastName].filter(Boolean).join(' ') ||
+      '';
+    const avatar = user.avatarUrl || user.photoUrl || '';
+    return res.json({ id: user.id, name, avatarUrl: avatar });
   } catch (err) {
     console.error('[user/public/:id]', err);
     return res.status(500).json({ error: 'Server error' });

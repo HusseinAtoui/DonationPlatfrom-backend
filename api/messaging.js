@@ -55,20 +55,23 @@ function safeBase64JsonDecode(b64) {
   try { return JSON.parse(Buffer.from(b64, 'base64').toString('utf8')); }
   catch { return null; }
 }
-// FIX: alias reserved "name" in both query & scan
+
+// ---- profiles (safe projection; alias reserved 'name') ----
 async function getUserBasicById(id) {
   if (!USER_TABLE || !id) return null;
   try {
     const q = await ddb.query({
       TableName: USER_TABLE,
       IndexName: 'id-index',
-      KeyConditionExpression: '#id = :id',
-      ProjectionExpression: '#id, #n, avatarUrl',
-      ExpressionAttributeNames: { '#id': 'id', '#n': 'name' },
+      KeyConditionExpression: 'id = :id',
       ExpressionAttributeValues: { ':id': id },
+      ProjectionExpression: 'id, #n, avatarUrl',
+      ExpressionAttributeNames: { '#n': 'name' },
+      Limit: 1,
     }).promise();
     if (q.Items && q.Items[0]) return q.Items[0];
   } catch (_) {}
+
   try {
     const s = await ddb.scan({
       TableName: USER_TABLE,
@@ -76,6 +79,7 @@ async function getUserBasicById(id) {
       ProjectionExpression: '#id, #n, avatarUrl',
       ExpressionAttributeNames: { '#id': 'id', '#n': 'name' },
       ExpressionAttributeValues: { ':id': id },
+      Limit: 1,
     }).promise();
     return (s.Items && s.Items[0]) || null;
   } catch (_) { return null; }
@@ -83,50 +87,27 @@ async function getUserBasicById(id) {
 
 async function getNgoBasicById(id) {
   if (!NGO_TABLE || !id) return null;
-  try {
-    const q = await ddb.query({
-      TableName: NGO_TABLE,
-      IndexName: 'id-index',
-      KeyConditionExpression: '#id = :id',
-      ProjectionExpression: '#id, #n, logoUrl, avatarUrl',
-      ExpressionAttributeNames: { '#id': 'id', '#n': 'name' },
-      ExpressionAttributeValues: { ':id': id },
-    }).promise();
-    if (q.Items && q.Items[0]) return q.Items[0];
-  } catch (_) {}
-  try {
-    const s = await ddb.scan({
-      TableName: NGO_TABLE,
-      FilterExpression: '#id = :id',
-      ProjectionExpression: '#id, #n, logoUrl, avatarUrl',
-      ExpressionAttributeNames: { '#id': 'id', '#n': 'name' },
-      ExpressionAttributeValues: { ':id': id },
-    }).promise();
-    return (s.Items && s.Items[0]) || null;
-  } catch (_) { return null; }
-}
-
-async function getNgoBasicById(id) {
-  if (!NGO_TABLE || !id) return null;
-  // Try id GSI first
   try {
     const q = await ddb.query({
       TableName: NGO_TABLE,
       IndexName: 'id-index',
       KeyConditionExpression: 'id = :id',
       ExpressionAttributeValues: { ':id': id },
-      ProjectionExpression: 'id, name, logoUrl, avatarUrl'
+      ProjectionExpression: 'id, #n, logoUrl, avatarUrl',
+      ExpressionAttributeNames: { '#n': 'name' },
+      Limit: 1,
     }).promise();
     if (q.Items && q.Items[0]) return q.Items[0];
   } catch (_) {}
-  // Fallback scan
+
   try {
     const s = await ddb.scan({
       TableName: NGO_TABLE,
       FilterExpression: '#i = :id',
-      ExpressionAttributeNames: { '#i': 'id' },
+      ExpressionAttributeNames: { '#i': 'id', '#n': 'name' },
       ExpressionAttributeValues: { ':id': id },
-      ProjectionExpression: 'id, name, logoUrl, avatarUrl'
+      ProjectionExpression: '#i, #n, logoUrl, avatarUrl',
+      Limit: 1,
     }).promise();
     return (s.Items && s.Items[0]) || null;
   } catch (_) { return null; }
@@ -178,7 +159,6 @@ async function maybeStampDisplayFields(conv) {
 
 // O(1) exact lookup via GSIs
 async function findExistingConversationFast({ userId, ngoId }) {
-  // Prefer userNgo-index (PK userId, SK ngoId)
   try {
     const out = await ddb.query({
       TableName: CONVERSATIONS_TABLE,
@@ -189,7 +169,7 @@ async function findExistingConversationFast({ userId, ngoId }) {
     }).promise();
     if (out.Items && out.Items[0]) return out.Items[0];
   } catch (_) {}
-  // Fallback the other way (PK ngoId, SK userId)
+
   try {
     const out = await ddb.query({
       TableName: CONVERSATIONS_TABLE,
@@ -229,7 +209,6 @@ async function bumpConversation(convId, lastMessage, tsISO, senderRole) {
 // ---------- routes ----------
 
 // Start (or fetch) a conversation
-// user: body { ngoId } ; ngo: body { userId }
 router.post('/conversations/start', authenticateJWT, async (req, res) => {
   try {
     const actor = actorFromReq(req);
@@ -325,8 +304,45 @@ router.get('/conversations', authenticateJWT, async (req, res) => {
   }
 });
 
+// Unread total for the current actor (for MessageIcon)
+router.get('/conversations/unread-count', authenticateJWT, async (req, res) => {
+  try {
+    const actor = actorFromReq(req);
+
+    if (actor.role === 'user') {
+      const out = await ddb.query({
+        TableName: CONVERSATIONS_TABLE,
+        IndexName: 'userId-index',
+        KeyConditionExpression: 'userId = :u',
+        ExpressionAttributeValues: { ':u': actor.id },
+        ProjectionExpression: 'id, userUnread',
+      }).promise();
+
+      const unread = (out.Items || []).reduce((sum, it) => sum + (it.userUnread || 0), 0);
+      return res.json({ unread });
+    }
+
+    if (actor.role === 'ngo') {
+      const out = await ddb.query({
+        TableName: CONVERSATIONS_TABLE,
+        IndexName: 'ngoId-index',
+        KeyConditionExpression: 'ngoId = :n',
+        ExpressionAttributeValues: { ':n': actor.id },
+        ProjectionExpression: 'id, ngoUnread',
+      }).promise();
+
+      const unread = (out.Items || []).reduce((sum, it) => sum + (it.ngoUnread || 0), 0);
+      return res.json({ unread });
+    }
+
+    return res.status(403).json({ error: 'Unsupported role.' });
+  } catch (err) {
+    console.error('[msg/unread]', err);
+    res.status(500).json({ error: 'Server error.' });
+  }
+});
+
 // Get messages (supports `cursor` token OR `from` ISO)
-// GET /conversations/:id/messages?limit=50&cursor=...&from=ISO
 router.get('/conversations/:id/messages', authenticateJWT, async (req, res) => {
   try {
     const actor = actorFromReq(req);
@@ -360,7 +376,6 @@ router.get('/conversations/:id/messages', authenticateJWT, async (req, res) => {
     try {
       out = await ddb.query(params).promise();
     } catch (e) {
-      // If table key schema is wrong, Query may throw ValidationException — fallback to Scan so user isn't blocked
       if (e.code === 'ValidationException') {
         console.warn('[msg/get] Query failed; falling back to Scan. Fix messages table keys.');
         const scanRes = await ddb.scan({
@@ -389,7 +404,7 @@ router.get('/conversations/:id/messages', authenticateJWT, async (req, res) => {
   }
 });
 
-// Send a message (uses composite SK)
+// Send a message
 router.post('/conversations/:id/messages', authenticateJWT, async (req, res) => {
   try {
     const actor = actorFromReq(req);
@@ -419,7 +434,6 @@ router.post('/conversations/:id/messages', authenticateJWT, async (req, res) => 
       readBy: [actor.id],
     };
 
-    // Prevent accidental duplicate writes
     await ddb.put({
       TableName: MESSAGES_TABLE,
       Item: item,
@@ -483,12 +497,9 @@ router.post('/attachments/presign', authenticateJWT, async (req, res) => {
     const conv = await getConversationById(conversationId);
     if (!canAccess(conv, actor)) return res.status(403).json({ error: 'Forbidden.' });
 
-    // sanitize basic filename
     const safeName = String(filename).replace(/[^\w.\-()+@ ]+/g, '_');
-
     const key = `conversations/${conversationId}/${uuidv4()}-${safeName}`;
 
-    // IMPORTANT: include ACL in the signature so the uploaded object is publicly readable
     const uploadUrl = await s3.getSignedUrlPromise('putObject', {
       Bucket: MESSAGES_BUCKET,
       Key: key,
@@ -497,14 +508,12 @@ router.post('/attachments/presign', authenticateJWT, async (req, res) => {
       Expires: 60 * 5,
     });
 
-    // region-safe public URL (us-east-1 uses s3.amazonaws.com)
     const region = process.env.AWS_REGION || 'us-east-1';
     const host = region === 'us-east-1'
       ? `https://${MESSAGES_BUCKET}.s3.amazonaws.com`
       : `https://${MESSAGES_BUCKET}.s3.${region}.amazonaws.com`;
     const publicUrl = `${host}/${encodeURI(key)}`;
 
-    // Tell the client which headers must be included on PUT
     res.json({
       uploadUrl,
       requiredHeaders: { 'Content-Type': contentType, 'x-amz-acl': 'public-read' },
