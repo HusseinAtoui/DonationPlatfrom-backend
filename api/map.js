@@ -46,7 +46,8 @@ router.get('/requests', async (req, res) => {
     let requests = (requestsData.Items || []).filter(req =>
       req.coordinates &&
       typeof req.coordinates.lat === 'number' &&
-      typeof req.coordinates.lng === 'number'
+      typeof req.coordinates.lng === 'number' &&
+      req.status !== 'completed'
     );
 
     if (category && category !== 'any') {
@@ -60,11 +61,7 @@ router.get('/requests', async (req, res) => {
     }
 
     const ngosData = await ddb.scan({ TableName: NGO_TABLE }).promise();
-    const ngos = (ngosData.Items || []).filter(ngo =>
-      ngo.coordinates &&
-      typeof ngo.coordinates.lat === 'number' &&
-      typeof ngo.coordinates.lng === 'number'
-    );
+    const ngos = (ngosData.Items || [])
 
     const requestsWithNgo = requests.map(req => {
       const ngo = ngos.find(n => n.id === req.ngoId);
