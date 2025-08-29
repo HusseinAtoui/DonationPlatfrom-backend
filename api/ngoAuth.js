@@ -40,6 +40,72 @@ const transporter = nodemailer.createTransport({
     pass: process.env.EMAIL_PASS
   }
 });
+function initialsFromName(name = '') {
+  const parts = String(name).trim().split(/\s+/).filter(Boolean);
+  const first = parts[0]?.[0] || '';
+  const last  = parts.length > 1 ? parts[parts.length - 1][0] : (parts[0]?.[1] || '');
+  return (first + last).toUpperCase();
+}
+
+function colorFromId(id = '') {
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+  const hue = h % 360;
+  return `hsl(${hue} 70% 70%)`;
+}
+
+function buildInitialsSVG({ name, id }) {
+  const initials = initialsFromName(name || 'NGO');
+  const bg = colorFromId(id || initials);
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <circle cx="128" cy="128" r="128" fill="${bg}"/>
+  <text x="50%" y="50%" dominant-baseline="central" text-anchor="middle"
+        font-family="Arial, sans-serif" font-size="100" font-weight="bold"
+        fill="#1f2937">${initials}</text>
+</svg>`;
+}
+function svgDataUrlFor({ id, name }) {
+  const svg = buildInitialsSVG({ id, name });
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+}
+
+async function ensureLogoUrl(ngo) {
+  if (ngo.logoUrl) return ngo.logoUrl;
+
+  // Try S3 first if bucket is configured
+  if (LOGOS_BUCKET) {
+    try {
+      const url = await uploadDefaultAvatar({ id: ngo.id, name: ngo.name });
+      await ddb.update({
+        TableName: NGO_TABLE,
+        Key: { email: (ngo.email || '').toLowerCase() },
+        UpdateExpression: 'SET logoUrl = :u',
+        ExpressionAttributeValues: { ':u': url }
+      }).promise();
+      return url;
+    } catch (e) {
+      console.error('[ensureLogoUrl] S3 upload failed, using data URL:', e);
+    }
+  }
+
+  // Fallback: inline SVG (no S3 needed)
+  return svgDataUrlFor({ id: ngo.id, name: ngo.name });
+}
+
+async function uploadDefaultAvatar({ id, name }) {
+  const key = `logos/default-${id}.svg`;
+  const svg = buildInitialsSVG({ name, id });
+const params = {
+  Bucket: LOGOS_BUCKET,
+  Key: key,
+  Body: svg,
+  ContentType: 'image/svg+xml'
+};
+
+  const out = await s3.upload(params).promise();
+  return out.Location;
+}
 
 /* ---------------- helpers (added) ---------------- */
 async function sendVerificationEmail(id, email) {
@@ -92,8 +158,17 @@ passport.use('ngo-google',
             profile.displayName ||
             [profile.name?.givenName, profile.name?.familyName].filter(Boolean).join(' ') ||
             'New NGO';
-          const logoUrl = profile.photos?.[0]?.value || '';
-
+     
+// after
+let logoUrl = profile.photos?.[0]?.value || '';
+if (!logoUrl) {
+  try {
+    logoUrl = await uploadDefaultAvatar({ id, name });
+  } catch (err) {
+    console.error('Default avatar generation failed (OAuth):', err);
+    logoUrl = '';
+  }
+}
           const item = {
             id, email, phone: '', name, location: '',
             coordinates: {lat: null, lng: null },
@@ -248,14 +323,14 @@ router.get('/auth/google/callback',
         JWT_SECRET,
         { expiresIn: '7d' }
       );
-
+const ensuredLogo = await ensureLogoUrl(ngo);
       const userData = {
         id: ngo.id,
         name: ngo.name,
         email: ngo.email,
         phone: ngo.phone || '',
         location: ngo.location || '',
-        logoUrl: ngo.logoUrl || '',
+        logoUrl:  ensuredLogo,
         verified: !!ngo.verified
       };
       const userDataString = encodeURIComponent(JSON.stringify(userData));
@@ -300,13 +375,13 @@ router.post('/create', upload.single('logo'), async (req, res) => {
   try {
     if (req.file) {
       const key = `logos/${uuidv4()}-${req.file.originalname}`;
-      const params = {
-        Bucket: LOGOS_BUCKET,
-        Key: key,
-        Body: req.file.buffer,
-        ContentType: req.file.mimetype,
-        ACL: 'public-read'
-      };
+     const params = {
+  Bucket: LOGOS_BUCKET,
+  Key: key,
+  Body: req.file.buffer,
+  ContentType: req.file.mimetype
+};
+
       const uploadResult = await s3.upload(params).promise();
       logoUrl = uploadResult.Location;
     }
@@ -315,7 +390,17 @@ router.post('/create', upload.single('logo'), async (req, res) => {
     if (existing.Item) return res.status(409).json({ error: 'NGO already exists.' });
 
     const passwordHash = await bcrypt.hash(password, 10);
-    const id = uuidv4();
+   const id = uuidv4();
+
+// if NGO didn't upload a logo, create a default avatar
+if (!logoUrl) {
+  try {
+    logoUrl = await uploadDefaultAvatar({ id, name });
+  } catch (err) {
+    console.error('Default avatar generation failed:', err);
+    logoUrl = ''; // fallback to empty if S3 upload fails
+  }
+}
 
     const item = {
       id, email, phone, name,
@@ -474,7 +559,7 @@ router.post('/login', async (req, res) => {
       JWT_SECRET,
       { expiresIn: '7d' }
     );
-
+  const ensuredLogo = await ensureLogoUrl(ngo);
     return res.json({
       token: jwtToken,
       user: {
@@ -483,7 +568,7 @@ router.post('/login', async (req, res) => {
         email: ngo.email,
         phone: ngo.phone,
         location: ngo.location,
-        logoUrl: ngo.logoUrl || '',
+        logoUrl: ensuredLogo,
         verified: !!ngo.verified
       }
     });
@@ -492,7 +577,6 @@ router.post('/login', async (req, res) => {
     return res.status(500).json({ error: 'Server error.' });
   }
 });
-
 // Me (read)
 router.get('/me', authenticateJWT, async (req, res) => {
   if (req.user.role !== 'ngo') return res.status(403).json({ error: 'Forbidden.' });
@@ -502,14 +586,15 @@ router.get('/me', authenticateJWT, async (req, res) => {
       Key: { email: (req.user.email || '').toLowerCase() }
     }).promise();
 
-    if (!Item) return res.status(404).json({ error: 'NGO not found.' });
-    res.json({ profile: Item });
+    if (!Item) return res.status(401).json({ error: 'Invalid session.' });
+  const ensuredLogo = await ensureLogoUrl(Item);
+  res.json({ profile: { ...Item, logoUrl: ensuredLogo } });
   } catch (err) {
     console.error('Error fetching profile:', err);
     res.status(500).json({ error: 'Server error.' });
   }
-  
 });
+
 
 // Me (patch) — aligns with your frontend PATCH /ngo/me
 router.patch('/me', authenticateJWT, async (req, res) => {
@@ -639,13 +724,13 @@ router.put('/update/:id', authenticateJWT, upload.single('logo'), async (req, re
 
     if (req.file) {
       const key = `logos/${uuidv4()}-${req.file.originalname}`;
-      const params = {
-        Bucket: LOGOS_BUCKET,
-        Key: key,
-        Body: req.file.buffer,
-        ContentType: req.file.mimetype,
-        ACL: 'public-read'
-      };
+    const params = {
+  Bucket: LOGOS_BUCKET,
+  Key: key,
+  Body: req.file.buffer,
+  ContentType: req.file.mimetype
+};
+
       const uploadResult = await s3.upload(params).promise();
       updateFields.logoUrl = uploadResult.Location;
     }

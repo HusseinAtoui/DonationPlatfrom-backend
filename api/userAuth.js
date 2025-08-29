@@ -104,7 +104,6 @@ router.post('/create', async (req, res) => {
     return res.status(500).json({ error: 'Server error.' });
   }
 });
-
 // ----------------------------------------------------------------------------
 // Verify email from signup
 // ----------------------------------------------------------------------------
@@ -117,21 +116,37 @@ router.get('/verify', async (req, res) => {
     if (decoded.typ !== 'user-email-verify') throw new Error('Wrong token type.');
     const { id, email } = decoded;
 
+    // Ensure the user exists and the id matches
+    const { Item: user } = await ddb.get({ TableName: USER_TABLE, Key: { email } }).promise();
+    if (!user) return res.status(404).json({ error: 'User not found.' });
+    if (user.id !== id) return res.status(400).json({ error: 'Token/user mismatch.' });
+
+    // Idempotent set verified + verifiedAt
     await ddb.update({
       TableName: USER_TABLE,
       Key: { email },
-      UpdateExpression: 'SET verified = :v',
-      ExpressionAttributeValues: { ':v': true }
+      UpdateExpression: 'SET verified = :v, verifiedAt = :t',
+      ExpressionAttributeValues: { ':v': true, ':t': Date.now() }
     }).promise();
 
-    // Issue app JWT and send JSON (you may also redirect to FRONTEND_URL)
-    const authJwt = issueAuthToken({ id, email, name: '' });
-    return res.json({ token: authJwt });
+    // Reload (to get latest name, avatar, etc.)
+    const { Item: fresh } = await ddb.get({ TableName: USER_TABLE, Key: { email } }).promise();
+
+    const authJwt = issueAuthToken({ id: fresh.id, email: fresh.email, name: fresh.name || '' });
+
+    const wantsJson =
+      req.query.json === '1' || (req.get('accept') || '').includes('application/json');
+
+    if (wantsJson) return res.json({ token: authJwt, user: sanitizeProfileForClient(fresh) });
+
+    const userStr = encodeURIComponent(JSON.stringify(sanitizeProfileForClient(fresh)));
+    return res.redirect(`${FRONTEND_URL}/login?token=${authJwt}&user=${userStr}`);
   } catch (err) {
     console.error('[user/verify] Error:', err);
     return res.status(400).json({ error: 'Invalid or expired token.' });
   }
 });
+
 
 // ----------------------------------------------------------------------------
 // Login (email OR phone via phone-index GSI)
@@ -218,15 +233,14 @@ router.patch('/me', authenticateJWT, async (req, res) => {
       );
 
       // Save "pending" info on the current record
-      await ddb.update({
-        TableName: USER_TABLE,
-        Key: { email: currentEmail },
-        UpdateExpression: 'SET pendingNewEmail = :ne, pendingEmailToken = :tk',
-        ExpressionAttributeValues: {
-          ':ne': nextEmail,
-          ':tk': token
-        }
-      }).promise();
+    // inside the email-change branch of PATCH /me
+await ddb.update({
+  TableName: USER_TABLE,
+  Key: { email: currentEmail },
+  UpdateExpression: 'SET pendingNewEmail = :ne, pendingEmailToken = :tk',
+  ExpressionAttributeValues: { ':ne': nextEmail, ':tk': token }
+}).promise();
+
 
       // Send to NEW email
       const link = `${API_URL}/api/user/confirm-email?token=${encodeURIComponent(token)}`;
@@ -293,15 +307,13 @@ router.delete('/me', authenticateJWT, async (req, res) => {
     return res.status(500).json({ error: 'Server error.' });
   }
 });
-
 // ----------------------------------------------------------------------------
 // Confirm new email (moves item to new PK)
-// - Validates token, copies record to new email, deletes old record
-// - Issues fresh JWT, then redirects to frontend with token (+user payload)
 // ----------------------------------------------------------------------------
 router.get('/confirm-email', async (req, res) => {
   const token = req.query.token;
   if (!token) return res.status(400).send('Token required.');
+
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     if (decoded.typ !== 'user-email-change') throw new Error('Wrong token type.');
@@ -314,18 +326,26 @@ router.get('/confirm-email', async (req, res) => {
     if (cur.id !== id) return res.status(400).send('Token/user mismatch.');
     if (cur.pendingNewEmail !== newEmail) return res.status(400).send('No pending change.');
 
-    // Prepare new item
-    const { passwordHash, ...rest } = cur; // keep passwordHash if using email/pass login
+    // Validate the stored pendingEmailToken matches this token (revocation safety)
+    if (!cur.pendingEmailToken || cur.pendingEmailToken !== token) {
+      return res.status(400).send('Email change token mismatch.');
+    }
+
+    // Build new item WITHOUT the pending fields
+    const {
+      pendingNewEmail, pendingEmailToken, // remove
+      ...copy
+    } = cur;
+
     const newItem = {
-      ...cur,
+      ...copy,
       email: newEmail,
       verified: true,
-      pendingNewEmail: undefined,
-      pendingEmailToken: undefined
+      verifiedAt: Date.now()
     };
 
     // Transact: Put new (if not exists), Delete old
-    const transact = {
+    await ddb.transactWrite({
       TransactItems: [
         {
           Put: {
@@ -341,20 +361,23 @@ router.get('/confirm-email', async (req, res) => {
           }
         }
       ]
-    };
-    await ddb.transactWrite(transact).promise();
+    }).promise();
 
     const appToken = issueAuthToken(newItem);
-    const userData = sanitizeProfileForClient(newItem);
-    const userStr = encodeURIComponent(JSON.stringify(userData));
+    const userStr = encodeURIComponent(JSON.stringify(sanitizeProfileForClient(newItem)));
 
-    // Redirect to frontend to store new token
+    const wantsJson =
+      req.query.json === '1' || (req.get('accept') || '').includes('application/json');
+
+    if (wantsJson) return res.json({ token: appToken, user: sanitizeProfileForClient(newItem) });
+
     return res.redirect(`${FRONTEND_URL}/login?token=${appToken}&user=${userStr}`);
   } catch (err) {
     console.error('[user/confirm-email] Error:', err);
     return res.status(400).send('Invalid or expired token.');
   }
 });
+
 // Sends the same verification link used for email/password signup
 async function sendUserVerificationEmail(id, email) {
   const token = jwt.sign(
@@ -425,7 +448,8 @@ router.use(passport.initialize());
 // ----------------------------------------------------------------------------
 // Google OAuth (user) — require email verification on first SSO
 // ----------------------------------------------------------------------------
-router.use(passport.initialize());
+
+
 
 passport.use(
   'user-google',
