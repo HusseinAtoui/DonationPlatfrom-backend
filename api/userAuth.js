@@ -17,7 +17,6 @@ require('dotenv').config();
 // ----------------------------------------------------------------------------
 const API_URL = (process.env.API_URL || 'http://localhost:4000').replace(/\/+$/, '');
 const FRONTEND_URL = (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/+$/, '');
-const USER_OAUTH_CALLBACK = `${API_URL}/api/user/auth/google/callback`;
 
 AWS.config.update({
   region: process.env.AWS_REGION,
@@ -48,7 +47,6 @@ function issueAuthToken(user) {
 }
 
 function sanitizeProfileForClient(u) {
-  // Omit sensitive fields
   const {
     passwordHash, verificationToken, pendingNewEmail, pendingEmailToken,
     ...safe
@@ -56,8 +54,29 @@ function sanitizeProfileForClient(u) {
   return safe;
 }
 
+async function getUserByEmail(email) {
+  const { Item } = await ddb.get({ TableName: USER_TABLE, Key: { email } }).promise();
+  return Item || null;
+}
+
+// Sends the same verification link used for email/password signup
+async function sendUserVerificationEmail(id, email) {
+  const token = jwt.sign(
+    { id, email, typ: 'user-email-verify' },
+    JWT_SECRET,
+    { expiresIn: '1h' }
+  );
+  const link = `${API_URL}/api/user/verify?token=${encodeURIComponent(token)}`;
+  await transporter.sendMail({
+    from: process.env.EMAIL_RECEIVER,
+    to: email,
+    subject: 'Verify Your Account',
+    text: `Click to verify your email: ${link}`
+  });
+}
+
 // ----------------------------------------------------------------------------
-// Signup (email verification)
+// Signup (email/password) with email verification
 // ----------------------------------------------------------------------------
 router.post('/create', async (req, res) => {
   try {
@@ -104,8 +123,9 @@ router.post('/create', async (req, res) => {
     return res.status(500).json({ error: 'Server error.' });
   }
 });
+
 // ----------------------------------------------------------------------------
-// Verify email from signup
+// Verify email (from signup / SSO-created accounts)
 // ----------------------------------------------------------------------------
 router.get('/verify', async (req, res) => {
   const token = req.query.token;
@@ -129,9 +149,8 @@ router.get('/verify', async (req, res) => {
       ExpressionAttributeValues: { ':v': true, ':t': Date.now() }
     }).promise();
 
-    // Reload (to get latest name, avatar, etc.)
+    // Reload
     const { Item: fresh } = await ddb.get({ TableName: USER_TABLE, Key: { email } }).promise();
-
     const authJwt = issueAuthToken({ id: fresh.id, email: fresh.email, name: fresh.name || '' });
 
     const wantsJson =
@@ -146,7 +165,6 @@ router.get('/verify', async (req, res) => {
     return res.status(400).json({ error: 'Invalid or expired token.' });
   }
 });
-
 
 // ----------------------------------------------------------------------------
 // Login (email OR phone via phone-index GSI)
@@ -203,9 +221,7 @@ router.get('/me', authenticateJWT, async (req, res) => {
 });
 
 // ----------------------------------------------------------------------------
-// Protected: Update profile
-// - If email changes: send confirm link (202) and DO NOT change PK yet
-// - Otherwise: update in place (200)
+// Protected: Update profile (with email-change confirmation)
 // ----------------------------------------------------------------------------
 router.patch('/me', authenticateJWT, async (req, res) => {
   if (req.user.role !== 'user') return res.status(403).json({ error: 'Forbidden.' });
@@ -222,27 +238,22 @@ router.patch('/me', authenticateJWT, async (req, res) => {
   const currentEmail = req.user.email;
 
   try {
-    // If requesting email change, send confirmation and store pending fields
+    // Email change flow → send confirm link (202), store pending fields
     if (nextEmailRaw && nextEmailRaw.toLowerCase().trim() !== currentEmail.toLowerCase()) {
       const nextEmail = String(nextEmailRaw).toLowerCase().trim();
-      // Create a short-lived token to confirm email change
       const token = jwt.sign(
         { typ: 'user-email-change', id: req.user.id, currentEmail, newEmail: nextEmail },
         JWT_SECRET,
         { expiresIn: '1h' }
       );
 
-      // Save "pending" info on the current record
-    // inside the email-change branch of PATCH /me
-await ddb.update({
-  TableName: USER_TABLE,
-  Key: { email: currentEmail },
-  UpdateExpression: 'SET pendingNewEmail = :ne, pendingEmailToken = :tk',
-  ExpressionAttributeValues: { ':ne': nextEmail, ':tk': token }
-}).promise();
+      await ddb.update({
+        TableName: USER_TABLE,
+        Key: { email: currentEmail },
+        UpdateExpression: 'SET pendingNewEmail = :ne, pendingEmailToken = :tk',
+        ExpressionAttributeValues: { ':ne': nextEmail, ':tk': token }
+      }).promise();
 
-
-      // Send to NEW email
       const link = `${API_URL}/api/user/confirm-email?token=${encodeURIComponent(token)}`;
       await transporter.sendMail({
         from: process.env.EMAIL_RECEIVER,
@@ -254,11 +265,10 @@ await ddb.update({
       return res.status(202).json({ status: 'verification_sent' });
     }
 
-    // Build dynamic update for other fields
+    // Dynamic update for other fields
     const sets = [];
     const names = {};
     const values = {};
-
     function setField(fieldName, value) {
       const key = `#${fieldName}`;
       const valKey = `:${fieldName}`;
@@ -307,6 +317,7 @@ router.delete('/me', authenticateJWT, async (req, res) => {
     return res.status(500).json({ error: 'Server error.' });
   }
 });
+
 // ----------------------------------------------------------------------------
 // Confirm new email (moves item to new PK)
 // ----------------------------------------------------------------------------
@@ -378,98 +389,62 @@ router.get('/confirm-email', async (req, res) => {
   }
 });
 
-// Sends the same verification link used for email/password signup
-async function sendUserVerificationEmail(id, email) {
-  const token = jwt.sign(
-    { id, email, typ: 'user-email-verify' },
-    JWT_SECRET,
-    { expiresIn: '1h' }
-  );
-  const link = `${API_URL}/api/user/verify?token=${encodeURIComponent(token)}`;
-  await transporter.sendMail({
-    from: process.env.EMAIL_RECEIVER,
-    to: email,
-    subject: 'Verify Your Account',
-    text: `Click to verify your email: ${link}`
-  });
-}// GET /api/user/public/:id  → { id, name, avatarUrl }
-router.get('/public/:id', async (req, res) => {
-  const id = req.params.id;
-  if (!id) return res.status(400).json({ error: 'id required' });
-
-  try {
-    let user = null;
-
-    // Try GSI id-index first (PK = id)
-    try {
-      const q = await ddb.query({
-        TableName: USER_TABLE,
-        IndexName: 'id-index',
-        KeyConditionExpression: '#id = :id',
-        ExpressionAttributeNames: { '#id': 'id', '#n': 'name' },
-        ExpressionAttributeValues: { ':id': id },
-        ProjectionExpression: '#id, #n, avatarUrl, photoUrl, firstName, lastName, displayName',
-        Limit: 1,
-      }).promise();
-      user = (q.Items || [])[0] || null;
-    } catch (_) {}
-
-    // Fallback: table scan if GSI not present
-    if (!user) {
-      const s = await ddb.scan({
-        TableName: USER_TABLE,
-        FilterExpression: '#id = :id',
-        ExpressionAttributeNames: { '#id': 'id', '#n': 'name' },
-        ExpressionAttributeValues: { ':id': id },
-        ProjectionExpression: '#id, #n, avatarUrl, photoUrl, firstName, lastName, displayName',
-      }).promise();
-      user = (s.Items || [])[0] || null;
-    }
-
-    if (!user) return res.status(404).json({ error: 'User not found' });
-
-    const name =
-      user.name ||
-      user.displayName ||
-      [user.firstName, user.lastName].filter(Boolean).join(' ') ||
-      '';
-    const avatar = user.avatarUrl || user.photoUrl || '';
-    return res.json({ id: user.id, name, avatarUrl: avatar });
-  } catch (err) {
-    console.error('[user/public/:id]', err);
-    return res.status(500).json({ error: 'Server error' });
-  }
-});
-
 // ----------------------------------------------------------------------------
-// Google OAuth (user)
+// Google OAuth (user) — split LOGIN vs SIGNUP flows
 // ----------------------------------------------------------------------------
 router.use(passport.initialize());
-// ----------------------------------------------------------------------------
-// Google OAuth (user) — require email verification on first SSO
-// ----------------------------------------------------------------------------
 
-
-
+// --- LOGIN strategy: do NOT create users here ---
 passport.use(
-  'user-google',
+  'user-google-login',
   new GoogleStrategy(
     {
       clientID: process.env.GOOGLE_CLIENT_ID_USER || process.env.GOOGLE_CLIENT_ID1,
       clientSecret: process.env.GOOGLE_CLIENT_SECRET_USER || process.env.GOOGLE_CLIENT_SECRET1,
-      callbackURL: USER_OAUTH_CALLBACK,
+      callbackURL: `${API_URL}/api/user/auth/google/callback/login`,
     },
     async (_accessToken, _refreshToken, profile, done) => {
       try {
         const email = (profile.emails?.[0]?.value || '').toLowerCase();
         if (!email) return done(new Error('Missing email from Google profile'));
 
-        // Try to get user by email (PK=email)
-        const { Item } = await ddb.get({ TableName: USER_TABLE, Key: { email } }).promise();
-        let user = Item || null;
-
-        // If not found, create a minimal user record and mark unverified
+        const user = await getUserByEmail(email);
         if (!user) {
+          // No account → route will redirect to signup with prefilled email
+          return done(null, { needsSignup: true, email });
+        }
+
+        if (!user.verified) {
+          try { await sendUserVerificationEmail(user.id, user.email); } catch (e) { console.error('[user-google-login] resend verify failed:', e); }
+          return done(null, { createdButUnverified: true, email: user.email });
+        }
+
+        return done(null, user); // existing + verified
+      } catch (err) {
+        return done(err);
+      }
+    }
+  )
+);
+
+// --- SIGNUP strategy: CREATE if not exists, then ask to verify ---
+passport.use(
+  'user-google-signup',
+  new GoogleStrategy(
+    {
+      clientID: process.env.GOOGLE_CLIENT_ID_USER || process.env.GOOGLE_CLIENT_ID1,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET_USER || process.env.GOOGLE_CLIENT_SECRET1,
+      callbackURL: `${API_URL}/api/user/auth/google/callback/signup`,
+    },
+    async (_accessToken, _refreshToken, profile, done) => {
+      try {
+        const email = (profile.emails?.[0]?.value || '').toLowerCase();
+        if (!email) return done(new Error('Missing email from Google profile'));
+
+        let user = await getUserByEmail(email);
+
+        if (!user) {
+          // Create minimal, unverified user
           const id = uuidv4();
           const name =
             profile.displayName ||
@@ -485,8 +460,8 @@ passport.use(
             location: '',
             avatarUrl,
             bio: '',
-            passwordHash: '',  // SSO-only initially
-            verified: false,   // ← must verify by email
+            passwordHash: '',  // SSO-only (no password yet)
+            verified: false,
             createdAt: nowTs(),
           };
 
@@ -496,27 +471,17 @@ passport.use(
             ConditionExpression: 'attribute_not_exists(email)',
           }).promise();
 
-          try {
-            await sendUserVerificationEmail(id, email);
-          } catch (e) {
-            console.error('[user-google] send verification failed:', e);
-          }
-
-          // Signal to callback: account exists but not verified
+          try { await sendUserVerificationEmail(id, email); } catch (e) { console.error('[user-google-signup] send verify failed:', e); }
           return done(null, { createdButUnverified: true, email });
         }
 
-        // Existing but still unverified → re-send verification & block login
+        // Account exists
         if (!user.verified) {
-          try {
-            await sendUserVerificationEmail(user.id, user.email);
-          } catch (e) {
-            console.error('[user-google] resend verification failed:', e);
-          }
+          try { await sendUserVerificationEmail(user.id, user.email); } catch (e) { console.error('[user-google-signup] resend verify failed:', e); }
           return done(null, { createdButUnverified: true, email: user.email });
         }
 
-        // Verified user → proceed
+        // Already verified → treat as login
         return done(null, user);
       } catch (err) {
         return done(err);
@@ -525,33 +490,32 @@ passport.use(
   )
 );
 
-// Start OAuth
-router.get('/auth/google',
-  passport.authenticate('user-google', { scope: ['profile', 'email'] })
+// ==== GOOGLE LOGIN FLOW ====
+// Start login
+router.get('/auth/google/login',
+  passport.authenticate('user-google-login', { scope: ['profile', 'email'] })
 );
 
-// OAuth Callback
+// Login callback
 router.get(
-  '/auth/google/callback',
-  passport.authenticate('user-google', {
+  '/auth/google/callback/login',
+  passport.authenticate('user-google-login', {
     session: false,
     failureRedirect: `${FRONTEND_URL}/login`
   }),
   async (req, res) => {
     try {
-      // If the strategy told us verification is required, don't issue a token
+      // No account → push to signup page with email prefilled
+      if (req.user?.needsSignup && req.user.email) {
+        return res.redirect(`${FRONTEND_URL}/signup/donor?sso=google&email=${encodeURIComponent(req.user.email)}`);
+      }
+
+      // Account exists but unverified → ask to check email
       if (req.user?.createdButUnverified) {
         const wantsJson = req.query.json === '1' || (req.get('accept') || '').includes('application/json');
-        if (wantsJson) {
-          return res.status(202).json({
-            status: 'verification_sent',
-            email: req.user.email
-          });
-        }
-        // Redirect front-end to show "check your email" UI
-        return res.redirect(
-          `${FRONTEND_URL}/login?verify=1&email=${encodeURIComponent(req.user.email)}`
-        );
+        if (wantsJson) return res.status(202).json({ status: 'verification_sent', email: req.user.email });
+
+        return res.redirect(`${FRONTEND_URL}/login?verify=1&email=${encodeURIComponent(req.user.email)}`);
       }
 
       // Normal verified login
@@ -565,11 +529,50 @@ router.get(
 
       return res.redirect(`${FRONTEND_URL}/login?token=${token}&user=${userDataString}`);
     } catch (err) {
-      console.error('[user/auth/google/callback] ERROR:', err);
+      console.error('[user/auth/google/callback/login] ERROR:', err);
       return res.status(500).json({ error: 'OAuth error' });
     }
   }
 );
 
+// ==== GOOGLE SIGNUP FLOW ====
+// Start signup
+router.get('/auth/google/signup',
+  passport.authenticate('user-google-signup', { scope: ['profile', 'email'] })
+);
+
+// Signup callback
+router.get(
+  '/auth/google/callback/signup',
+  passport.authenticate('user-google-signup', {
+    session: false,
+    failureRedirect: `${FRONTEND_URL}/signup/donor`
+  }),
+  async (req, res) => {
+    try {
+      // New or existing-but-unverified → tell them to check email
+      if (req.user?.createdButUnverified) {
+        const wantsJson = req.query.json === '1' || (req.get('accept') || '').includes('application/json');
+        if (wantsJson) return res.status(202).json({ status: 'verification_sent', email: req.user.email });
+
+        return res.redirect(`${FRONTEND_URL}/login?verify=1&email=${encodeURIComponent(req.user.email)}`);
+      }
+
+      // Already verified (user clicked signup but has account) → sign them in
+      const u = req.user;
+      const token = issueAuthToken(u);
+      const userData = sanitizeProfileForClient(u);
+      const userDataString = encodeURIComponent(JSON.stringify(userData));
+
+      const wantsJson = req.query.json === '1' || (req.get('accept') || '').includes('application/json');
+      if (wantsJson) return res.json({ token, user: userData });
+
+      return res.redirect(`${FRONTEND_URL}/login?token=${token}&user=${userDataString}`);
+    } catch (err) {
+      console.error('[user/auth/google/callback/signup] ERROR:', err);
+      return res.status(500).json({ error: 'OAuth error' });
+    }
+  }
+);
 
 module.exports = router;
