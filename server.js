@@ -20,7 +20,7 @@ app.get('/api/health', (req, res) => res.json({ ok: true }));
 app.use('/api/ngo', ngoAuth);
 app.use('/api/user', userAuth);
 app.use('/api/home', home);
-app.use('/map', map)
+app.use('/api/map', map)
 app.use('/api/messages', messaging);
 // error handler
 app.use((err, req, res, next) => {
