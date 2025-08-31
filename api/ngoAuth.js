@@ -111,6 +111,12 @@ async function ensureLogoUrl(ngo) {
   }
   return svgDataUrlFor({ id: ngo.id, name: ngo.name });
 }
+function isProfileComplete(ngo) {
+  const locOk = typeof ngo.location === 'string' && ngo.location.trim().length > 0;
+  const latOk = ngo?.coordinates && typeof ngo.coordinates.lat === 'number';
+  const lngOk = ngo?.coordinates && typeof ngo.coordinates.lng === 'number';
+  return locOk && latOk && lngOk;
+}
 
 /* ---------------- Email helpers ---------------- */
 async function sendVerificationEmail(id, email) {
@@ -204,7 +210,9 @@ passport.use('ngo-google-signup',
             passwordHash: '',
             inventorySize: 0, requiredClothing: '',
             logoUrl, bio: '', summary: '',
-            verified: false, createdAt: Date.now()
+            verified: false,
+              profileComplete: false,                 // ← NEW
+ createdAt: Date.now()
           };
 
           await ddb.put({
@@ -270,6 +278,12 @@ router.get('/auth/google/callback/login',
         verified: !!ngo.verified
       };
       const userDataString = encodeURIComponent(JSON.stringify(userData));
+      // 🚨 NEW: redirect to onboarding if profile is incomplete
+      if (!isProfileComplete(ngo)) {
+        return res.redirect(
+          `${FRONTEND_URL}/onboarding/ngo/location?token=${jwtToken}&user=${userDataString}`
+        );
+      }
 
       const wantsJson = req.query.json === '1' || (req.get('accept') || '').includes('application/json');
       if (wantsJson) return res.json({ token: jwtToken, user: userData });
@@ -614,7 +628,8 @@ router.post('/login', async (req, res) => {
         location: ngo.location,
         logoUrl: ensuredLogo,
         verified: !!ngo.verified
-      }
+      } , needsOnboarding: !isProfileComplete(ngo)  // ← NEW
+
     });
   } catch (err) {
     console.error('[NGO][LOGIN] ERROR:', err);
@@ -730,6 +745,17 @@ router.patch('/me', authenticateJWT, async (req, res) => {
       ExpressionAttributeValues: exprVals,
       ReturnValues: 'ALL_NEW'
     }).promise();
+    // NEW: mark profileComplete if they now have location + coordinates
+    const complete = isProfileComplete(Attributes);
+    if ((Attributes.profileComplete || false) !== complete) {
+      await ddb.update({
+        TableName: NGO_TABLE,
+        Key: { email: currentEmail },
+        UpdateExpression: 'SET profileComplete = :pc',
+        ExpressionAttributeValues: { ':pc': complete }
+      }).promise();
+      Attributes.profileComplete = complete;
+    }
 
     return res.json({ profile: Attributes });
   } catch (err) {
