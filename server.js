@@ -22,6 +22,10 @@ app.use('/api/user', userAuth);
 app.use('/api/home', home);
 app.use('/api/map', map)
 app.use('/api/messages', messaging);
+app.get("/", (req, res) => {
+  res.send("✅ Backend is running!");
+});
+
 // error handler
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
