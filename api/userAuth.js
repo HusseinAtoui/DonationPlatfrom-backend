@@ -2,6 +2,7 @@
 const express = require('express');
 const router = express.Router();
 const AWS = require('aws-sdk');
+
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 const nodemailer = require('nodemailer');
@@ -21,7 +22,7 @@ const FRONTEND_URL = (process.env.FRONTEND_URL || 'http://localhost:3000').repla
 AWS.config.update({
   region: process.env.AWS_REGION,
   accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
 });
 const ddb = new AWS.DynamoDB.DocumentClient();
 
@@ -30,7 +31,7 @@ const JWT_SECRET = process.env.JWT_SECRET;
 
 const transporter = nodemailer.createTransport({
   service: 'gmail',
-  auth: { user: process.env.EMAIL_RECEIVER, pass: process.env.EMAIL_PASS }
+  auth: { user: process.env.EMAIL_RECEIVER, pass: process.env.EMAIL_PASS },
 });
 
 const nowTs = () => Date.now();
@@ -48,7 +49,10 @@ function issueAuthToken(user) {
 
 function sanitizeProfileForClient(u) {
   const {
-    passwordHash, verificationToken, pendingNewEmail, pendingEmailToken,
+    passwordHash,
+    verificationToken,
+    pendingNewEmail,
+    pendingEmailToken,
     ...safe
   } = u || {};
   return safe;
@@ -71,7 +75,7 @@ async function sendUserVerificationEmail(id, email) {
     from: process.env.EMAIL_RECEIVER,
     to: email,
     subject: 'Verify Your Account',
-    text: `Click to verify your email: ${link}`
+    text: `Click to verify your email: ${link}`,
   });
 }
 
@@ -102,19 +106,23 @@ router.post('/create', async (req, res) => {
       bio: bio || '',
       passwordHash,
       verified: false,
-      createdAt: nowTs()
+      createdAt: nowTs(),
     };
 
     await ddb.put({ TableName: USER_TABLE, Item: newUser }).promise();
 
     // Email verification token (1h)
-    const verificationJwt = jwt.sign({ id, email: normEmail, typ: 'user-email-verify' }, JWT_SECRET, { expiresIn: '1h' });
+    const verificationJwt = jwt.sign(
+      { id, email: normEmail, typ: 'user-email-verify' },
+      JWT_SECRET,
+      { expiresIn: '1h' }
+    );
     const link = `${API_URL}/api/user/verify?token=${encodeURIComponent(verificationJwt)}`;
     await transporter.sendMail({
       from: process.env.EMAIL_RECEIVER,
       to: normEmail,
       subject: 'Verify Your Account',
-      text: `Click to verify your email: ${link}`
+      text: `Click to verify your email: ${link}`,
     });
 
     return res.status(201).json({ status: 'accepted' });
@@ -142,16 +150,22 @@ router.get('/verify', async (req, res) => {
     if (user.id !== id) return res.status(400).json({ error: 'Token/user mismatch.' });
 
     // Idempotent set verified + verifiedAt
-    await ddb.update({
-      TableName: USER_TABLE,
-      Key: { email },
-      UpdateExpression: 'SET verified = :v, verifiedAt = :t',
-      ExpressionAttributeValues: { ':v': true, ':t': Date.now() }
-    }).promise();
+    await ddb
+      .update({
+        TableName: USER_TABLE,
+        Key: { email },
+        UpdateExpression: 'SET verified = :v, verifiedAt = :t',
+        ExpressionAttributeValues: { ':v': true, ':t': Date.now() },
+      })
+      .promise();
 
     // Reload
     const { Item: fresh } = await ddb.get({ TableName: USER_TABLE, Key: { email } }).promise();
-    const authJwt = issueAuthToken({ id: fresh.id, email: fresh.email, name: fresh.name || '' });
+    const authJwt = issueAuthToken({
+      id: fresh.id,
+      email: fresh.email,
+      name: fresh.name || '',
+    });
 
     const wantsJson =
       req.query.json === '1' || (req.get('accept') || '').includes('application/json');
@@ -167,7 +181,7 @@ router.get('/verify', async (req, res) => {
 });
 
 // ----------------------------------------------------------------------------
-// Login (email OR phone via phone-index GSI)
+/** Login (email OR phone via phone-index GSI) */
 // ----------------------------------------------------------------------------
 router.post('/login', async (req, res) => {
   const { identifier, password } = req.body || {};
@@ -179,20 +193,21 @@ router.post('/login', async (req, res) => {
       ? {
           TableName: USER_TABLE,
           KeyConditionExpression: 'email = :id',
-          ExpressionAttributeValues: { ':id': String(identifier).toLowerCase().trim() }
+          ExpressionAttributeValues: { ':id': String(identifier).toLowerCase().trim() },
         }
       : {
           TableName: USER_TABLE,
           IndexName: 'phone-index',
           KeyConditionExpression: 'phone = :id',
-          ExpressionAttributeValues: { ':id': String(identifier).trim() }
+          ExpressionAttributeValues: { ':id': String(identifier).trim() },
         };
 
     const result = await ddb.query(params).promise();
     const user = (result.Items || [])[0];
     if (!user) return res.status(401).json({ error: 'Invalid credentials.' });
     if (!user.verified) return res.status(401).json({ error: 'Email not verified.' });
-    if (!user.passwordHash) return res.status(400).json({ error: 'Use Google login for this account.' });
+    if (!user.passwordHash)
+      return res.status(400).json({ error: 'Use Google login for this account.' });
 
     const ok = await bcrypt.compare(password, user.passwordHash);
     if (!ok) return res.status(401).json({ error: 'Invalid credentials.' });
@@ -211,7 +226,9 @@ router.post('/login', async (req, res) => {
 router.get('/me', authenticateJWT, async (req, res) => {
   if (req.user.role !== 'user') return res.status(403).json({ error: 'Forbidden.' });
   try {
-    const { Item } = await ddb.get({ TableName: USER_TABLE, Key: { email: req.user.email } }).promise();
+    const { Item } = await ddb
+      .get({ TableName: USER_TABLE, Key: { email: req.user.email } })
+      .promise();
     if (!Item) return res.status(404).json({ error: 'User not found.' });
     return res.json({ profile: sanitizeProfileForClient(Item) });
   } catch (err) {
@@ -226,15 +243,7 @@ router.get('/me', authenticateJWT, async (req, res) => {
 router.patch('/me', authenticateJWT, async (req, res) => {
   if (req.user.role !== 'user') return res.status(403).json({ error: 'Forbidden.' });
 
-  const {
-    name,
-    email: nextEmailRaw,
-    phone,
-    location,
-    avatarUrl,
-    bio
-  } = req.body || {};
-
+  const { name, email: nextEmailRaw, phone, location, avatarUrl, bio } = req.body || {};
   const currentEmail = req.user.email;
 
   try {
@@ -247,19 +256,21 @@ router.patch('/me', authenticateJWT, async (req, res) => {
         { expiresIn: '1h' }
       );
 
-      await ddb.update({
-        TableName: USER_TABLE,
-        Key: { email: currentEmail },
-        UpdateExpression: 'SET pendingNewEmail = :ne, pendingEmailToken = :tk',
-        ExpressionAttributeValues: { ':ne': nextEmail, ':tk': token }
-      }).promise();
+      await ddb
+        .update({
+          TableName: USER_TABLE,
+          Key: { email: currentEmail },
+          UpdateExpression: 'SET pendingNewEmail = :ne, pendingEmailToken = :tk',
+          ExpressionAttributeValues: { ':ne': nextEmail, ':tk': token },
+        })
+        .promise();
 
       const link = `${API_URL}/api/user/confirm-email?token=${encodeURIComponent(token)}`;
       await transporter.sendMail({
         from: process.env.EMAIL_RECEIVER,
         to: nextEmail,
         subject: 'Confirm your new email',
-        text: `Click to confirm your new email address: ${link}`
+        text: `Click to confirm your new email address: ${link}`,
       });
 
       return res.status(202).json({ status: 'verification_sent' });
@@ -279,12 +290,13 @@ router.patch('/me', authenticateJWT, async (req, res) => {
 
     if (typeof name === 'string') setField('name', name.trim());
     if (typeof phone === 'string') setField('phone', phone.trim());
-    if (typeof location === 'string' || typeof location === 'object') setField('location', location);
+    if (typeof location === 'string' || typeof location === 'object')
+      setField('location', location);
     if (typeof avatarUrl === 'string') setField('avatarUrl', avatarUrl.trim());
     if (typeof bio === 'string') setField('bio', bio);
 
     if (sets.length === 0) {
-      return res.json({ profile: { } }); // nothing to update
+      return res.json({ profile: {} }); // nothing to update
     }
 
     const updateParams = {
@@ -293,7 +305,7 @@ router.patch('/me', authenticateJWT, async (req, res) => {
       UpdateExpression: `SET ${sets.join(', ')}`,
       ExpressionAttributeNames: names,
       ExpressionAttributeValues: values,
-      ReturnValues: 'ALL_NEW'
+      ReturnValues: 'ALL_NEW',
     };
 
     const out = await ddb.update(updateParams).promise();
@@ -332,7 +344,9 @@ router.get('/confirm-email', async (req, res) => {
     const { id, currentEmail, newEmail } = decoded;
 
     // Load current item and sanity-check
-    const { Item: cur } = await ddb.get({ TableName: USER_TABLE, Key: { email: currentEmail } }).promise();
+    const { Item: cur } = await ddb
+      .get({ TableName: USER_TABLE, Key: { email: currentEmail } })
+      .promise();
     if (!cur) return res.status(404).send('User not found.');
     if (cur.id !== id) return res.status(400).send('Token/user mismatch.');
     if (cur.pendingNewEmail !== newEmail) return res.status(400).send('No pending change.');
@@ -343,36 +357,35 @@ router.get('/confirm-email', async (req, res) => {
     }
 
     // Build new item WITHOUT the pending fields
-    const {
-      pendingNewEmail, pendingEmailToken, // remove
-      ...copy
-    } = cur;
+    const { pendingNewEmail, pendingEmailToken, ...copy } = cur;
 
     const newItem = {
       ...copy,
       email: newEmail,
       verified: true,
-      verifiedAt: Date.now()
+      verifiedAt: Date.now(),
     };
 
     // Transact: Put new (if not exists), Delete old
-    await ddb.transactWrite({
-      TransactItems: [
-        {
-          Put: {
-            TableName: USER_TABLE,
-            Item: newItem,
-            ConditionExpression: 'attribute_not_exists(email)'
-          }
-        },
-        {
-          Delete: {
-            TableName: USER_TABLE,
-            Key: { email: currentEmail }
-          }
-        }
-      ]
-    }).promise();
+    await ddb
+      .transactWrite({
+        TransactItems: [
+          {
+            Put: {
+              TableName: USER_TABLE,
+              Item: newItem,
+              ConditionExpression: 'attribute_not_exists(email)',
+            },
+          },
+          {
+            Delete: {
+              TableName: USER_TABLE,
+              Key: { email: currentEmail },
+            },
+          },
+        ],
+      })
+      .promise();
 
     const appToken = issueAuthToken(newItem);
     const userStr = encodeURIComponent(JSON.stringify(sanitizeProfileForClient(newItem)));
@@ -415,7 +428,11 @@ passport.use(
         }
 
         if (!user.verified) {
-          try { await sendUserVerificationEmail(user.id, user.email); } catch (e) { console.error('[user-google-login] resend verify failed:', e); }
+          try {
+            await sendUserVerificationEmail(user.id, user.email);
+          } catch (e) {
+            console.error('[user-google-login] resend verify failed:', e);
+          }
           return done(null, { createdButUnverified: true, email: user.email });
         }
 
@@ -460,24 +477,34 @@ passport.use(
             location: '',
             avatarUrl,
             bio: '',
-            passwordHash: '',  // SSO-only (no password yet)
+            passwordHash: '', // SSO-only (no password yet)
             verified: false,
             createdAt: nowTs(),
           };
 
-          await ddb.put({
-            TableName: USER_TABLE,
-            Item: user,
-            ConditionExpression: 'attribute_not_exists(email)',
-          }).promise();
+          await ddb
+            .put({
+              TableName: USER_TABLE,
+              Item: user,
+              ConditionExpression: 'attribute_not_exists(email)',
+            })
+            .promise();
 
-          try { await sendUserVerificationEmail(id, email); } catch (e) { console.error('[user-google-signup] send verify failed:', e); }
+          try {
+            await sendUserVerificationEmail(id, email);
+          } catch (e) {
+            console.error('[user-google-signup] send verify failed:', e);
+          }
           return done(null, { createdButUnverified: true, email });
         }
 
         // Account exists
         if (!user.verified) {
-          try { await sendUserVerificationEmail(user.id, user.email); } catch (e) { console.error('[user-google-signup] resend verify failed:', e); }
+          try {
+            await sendUserVerificationEmail(user.id, user.email);
+          } catch (e) {
+            console.error('[user-google-signup] resend verify failed:', e);
+          }
           return done(null, { createdButUnverified: true, email: user.email });
         }
 
@@ -492,7 +519,8 @@ passport.use(
 
 // ==== GOOGLE LOGIN FLOW ====
 // Start login
-router.get('/auth/google/login',
+router.get(
+  '/auth/google/login',
   passport.authenticate('user-google-login', { scope: ['profile', 'email'] })
 );
 
@@ -501,21 +529,26 @@ router.get(
   '/auth/google/callback/login',
   passport.authenticate('user-google-login', {
     session: false,
-    failureRedirect: `${FRONTEND_URL}/login`
+    failureRedirect: `${FRONTEND_URL}/login`,
   }),
   async (req, res) => {
     try {
       // No account → push to signup page with email prefilled
       if (req.user?.needsSignup && req.user.email) {
-        return res.redirect(`${FRONTEND_URL}/signup/donor?sso=google&email=${encodeURIComponent(req.user.email)}`);
+        return res.redirect(
+          `${FRONTEND_URL}/signup/donor?sso=google&email=${encodeURIComponent(req.user.email)}`
+        );
       }
 
       // Account exists but unverified → ask to check email
       if (req.user?.createdButUnverified) {
-        const wantsJson = req.query.json === '1' || (req.get('accept') || '').includes('application/json');
+        const wantsJson =
+          req.query.json === '1' || (req.get('accept') || '').includes('application/json');
         if (wantsJson) return res.status(202).json({ status: 'verification_sent', email: req.user.email });
 
-        return res.redirect(`${FRONTEND_URL}/login?verify=1&email=${encodeURIComponent(req.user.email)}`);
+        return res.redirect(
+          `${FRONTEND_URL}/login?verify=1&email=${encodeURIComponent(req.user.email)}`
+        );
       }
 
       // Normal verified login
@@ -524,7 +557,8 @@ router.get(
       const userData = sanitizeProfileForClient(u);
       const userDataString = encodeURIComponent(JSON.stringify(userData));
 
-      const wantsJson = req.query.json === '1' || (req.get('accept') || '').includes('application/json');
+      const wantsJson =
+        req.query.json === '1' || (req.get('accept') || '').includes('application/json');
       if (wantsJson) return res.json({ token, user: userData });
 
       return res.redirect(`${FRONTEND_URL}/login?token=${token}&user=${userDataString}`);
@@ -537,7 +571,8 @@ router.get(
 
 // ==== GOOGLE SIGNUP FLOW ====
 // Start signup
-router.get('/auth/google/signup',
+router.get(
+  '/auth/google/signup',
   passport.authenticate('user-google-signup', { scope: ['profile', 'email'] })
 );
 
@@ -546,16 +581,19 @@ router.get(
   '/auth/google/callback/signup',
   passport.authenticate('user-google-signup', {
     session: false,
-    failureRedirect: `${FRONTEND_URL}/signup/donor`
+    failureRedirect: `${FRONTEND_URL}/signup/donor`,
   }),
   async (req, res) => {
     try {
       // New or existing-but-unverified → tell them to check email
       if (req.user?.createdButUnverified) {
-        const wantsJson = req.query.json === '1' || (req.get('accept') || '').includes('application/json');
+        const wantsJson =
+          req.query.json === '1' || (req.get('accept') || '').includes('application/json');
         if (wantsJson) return res.status(202).json({ status: 'verification_sent', email: req.user.email });
 
-        return res.redirect(`${FRONTEND_URL}/login?verify=1&email=${encodeURIComponent(req.user.email)}`);
+        return res.redirect(
+          `${FRONTEND_URL}/login?verify=1&email=${encodeURIComponent(req.user.email)}`
+        );
       }
 
       // Already verified (user clicked signup but has account) → sign them in
@@ -564,7 +602,8 @@ router.get(
       const userData = sanitizeProfileForClient(u);
       const userDataString = encodeURIComponent(JSON.stringify(userData));
 
-      const wantsJson = req.query.json === '1' || (req.get('accept') || '').includes('application/json');
+      const wantsJson =
+        req.query.json === '1' || (req.get('accept') || '').includes('application/json');
       if (wantsJson) return res.json({ token, user: userData });
 
       return res.redirect(`${FRONTEND_URL}/login?token=${token}&user=${userDataString}`);

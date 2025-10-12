@@ -10,6 +10,7 @@ const { authenticateJWT } = require('../middleware/auth');
 const multer = require('multer');
 const passport = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
+
 require('dotenv').config();
 
 /* ---------------- ENV / CONFIG ---------------- */
@@ -32,7 +33,14 @@ const NGO_OAUTH_SIGNUP_CALLBACK = `${API_URL}/api/ngo/auth/google/callback/signu
 console.log('[NGO][Google] Login CB :', NGO_OAUTH_LOGIN_CALLBACK);
 console.log('[NGO][Google] Signup CB:', NGO_OAUTH_SIGNUP_CALLBACK);
 
-/* ---------------- AWS ---------------- */
+/* === ADMIN ENV === */
+const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '')
+  .split(',')
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
+const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH || '';
+
+/* ---------------- AWS (v2) ---------------- */
 AWS.config.update({
   region: process.env.AWS_REGION,
   accessKeyId: process.env.AWS_ACCESS_KEY_ID,
@@ -87,7 +95,7 @@ async function uploadDefaultAvatar({ id, name }) {
   const params = {
     Bucket: LOGOS_BUCKET,
     Key: key,
-    Body: svg,
+    Body: Buffer.from(svg, 'utf8'),
     ContentType: 'image/svg+xml'
   };
   const out = await s3.upload(params).promise();
@@ -141,6 +149,19 @@ async function sendEmailChangeVerification(id, oldEmail, newEmail) {
     to: newEmail,
     subject: 'Confirm your new email for TyebeTyebak (NGO)',
     text: `You requested to change your NGO email from ${oldEmail} to ${newEmail}.\n\nConfirm the change by clicking: ${link}\n\nIf you didn't request this, ignore this message.`
+  });
+}
+
+/* ------- NEW: code-based email change helpers (for UI modal) ------- */
+function generate6DigitCode() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+async function sendEmailChangeCode(newEmail, code) {
+  await transporter.sendMail({
+    from: process.env.EMAIL_RECEIVER,
+    to: newEmail,
+    subject: 'Your verification code',
+    text: `Your verification code is: ${code}\nIt expires in 10 minutes.`
   });
 }
 
@@ -211,8 +232,14 @@ passport.use('ngo-google-signup',
             inventorySize: 0, requiredClothing: '',
             logoUrl, bio: '', summary: '',
             verified: false,
-              profileComplete: false,                 // ← NEW
- createdAt: Date.now()
+            profileComplete: false,
+            // NEW defaults for UI fields
+            workingHours: '',
+            social: { website: '', instagram: '', facebook: '' },
+            chipOrder: ['location', 'phone', 'email', 'hours'],
+            createdAt: Date.now(),
+            reviewStatus: 'pending',
+            reviewNote: ''
           };
 
           await ddb.put({
@@ -262,6 +289,16 @@ router.get('/auth/google/callback/login',
       }
 
       const ngo = req.user;
+
+      // Block if not approved
+      if (ngo.reviewStatus !== 'approved') {
+        const email = encodeURIComponent(ngo.email || '');
+        if (ngo.reviewStatus === 'rejected') {
+          return res.redirect(`${FRONTEND_URL}/login?rejected=1&email=${email}`);
+        }
+        return res.redirect(`${FRONTEND_URL}/login?awaitingApproval=1&email=${email}`);
+      }
+
       const jwtToken = jwt.sign(
         { id: ngo.id, role: 'ngo', email: ngo.email, name: ngo.name },
         JWT_SECRET,
@@ -278,7 +315,7 @@ router.get('/auth/google/callback/login',
         verified: !!ngo.verified
       };
       const userDataString = encodeURIComponent(JSON.stringify(userData));
-      // 🚨 NEW: redirect to onboarding if profile is incomplete
+      // redirect to onboarding if profile is incomplete
       if (!isProfileComplete(ngo)) {
         return res.redirect(
           `${FRONTEND_URL}/onboarding/ngo/location?token=${jwtToken}&user=${userDataString}`
@@ -307,6 +344,16 @@ router.get('/auth/google/callback/signup',
 
       // If verified already, log in.
       const ngo = req.user;
+
+      // Block if not approved
+      if (ngo.reviewStatus !== 'approved') {
+        const email = encodeURIComponent(ngo.email || '');
+        if (ngo.reviewStatus === 'rejected') {
+          return res.redirect(`${FRONTEND_URL}/login?rejected=1&email=${email}`);
+        }
+        return res.redirect(`${FRONTEND_URL}/login?awaitingApproval=1&email=${email}`);
+      }
+
       const jwtToken = jwt.sign(
         { id: ngo.id, role: 'ngo', email: ngo.email, name: ngo.name },
         JWT_SECRET,
@@ -414,6 +461,107 @@ async function cascadeDeleteNgoResources({ ngoId, ngoEmail }) {
   }
 }
 
+/* === ADMIN GUARD === */
+function requireAdmin(req, res, next) {
+  if (req.user && req.user.role === 'admin') return next();
+  return res.status(403).json({ error: 'Admin only.' });
+}
+
+/* === ADMIN ROUTES === */
+// Login as admin: returns JWT with role=admin
+router.post('/admin/login', async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    const emailNorm = String(email || '').trim().toLowerCase();
+    const pass = String(password || '');
+
+    if (!emailNorm || !pass) {
+      return res.status(400).json({ error: 'Email and password required.' });
+    }
+    if (!ADMIN_EMAILS.includes(emailNorm)) {
+      return res.status(401).json({ error: 'Invalid credentials.' });
+    }
+    if (!ADMIN_PASSWORD_HASH) {
+      return res.status(500).json({ error: 'Admin password not configured.' });
+    }
+
+    const ok = await bcrypt.compare(pass, ADMIN_PASSWORD_HASH);
+    if (!ok) return res.status(401).json({ error: 'Invalid credentials.' });
+
+    const token = jwt.sign(
+      { role: 'admin', email: emailNorm },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+    return res.json({ token, user: { role: 'admin', email: emailNorm } });
+  } catch (err) {
+    console.error('[ADMIN][LOGIN] ERROR:', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// List NGOs pending review
+router.get('/admin/ngos/pending',
+  authenticateJWT,
+  requireAdmin,
+  async (_req, res) => {
+    try {
+      const data = await ddb.scan({
+        TableName: NGO_TABLE,
+        FilterExpression: '#rs = :p',
+        ExpressionAttributeNames: { '#rs': 'reviewStatus' },
+        ExpressionAttributeValues: { ':p': 'pending' }
+      }).promise();
+      res.json(data.Items || []);
+    } catch (err) {
+      console.error('[ADMIN][LIST PENDING] ERROR:', err);
+      res.status(500).json({ error: 'Server error.' });
+    }
+  }
+);
+
+// Approve an NGO (by email key)
+router.post('/admin/ngos/:email/approve',
+  authenticateJWT,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const emailKey = String(req.params.email || '').toLowerCase();
+      await ddb.update({
+        TableName: NGO_TABLE,
+        Key: { email: emailKey },
+        UpdateExpression: 'SET reviewStatus = :a, reviewNote = :note',
+        ExpressionAttributeValues: { ':a': 'approved', ':note': req.body?.note || '' }
+      }).promise();
+      res.json({ status: 'approved', email: emailKey });
+    } catch (err) {
+      console.error('[ADMIN][APPROVE] ERROR:', err);
+      res.status(500).json({ error: 'Server error.' });
+    }
+  }
+);
+
+// Reject an NGO (by email key)
+router.post('/admin/ngos/:email/reject',
+  authenticateJWT,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const emailKey = String(req.params.email || '').toLowerCase();
+      await ddb.update({
+        TableName: NGO_TABLE,
+        Key: { email: emailKey },
+        UpdateExpression: 'SET reviewStatus = :r, reviewNote = :note',
+        ExpressionAttributeValues: { ':r': 'rejected', ':note': req.body?.note || '' }
+      }).promise();
+      res.json({ status: 'rejected', email: emailKey });
+    } catch (err) {
+      console.error('[ADMIN][REJECT] ERROR:', err);
+      res.status(500).json({ error: 'Server error.' });
+    }
+  }
+);
+
 /* ---------------- REST: NGO endpoints (kept) ---------------- */
 
 // List NGOs
@@ -482,7 +630,13 @@ router.post('/create', upload.single('logo'), async (req, res) => {
       bio: bio || '',
       summary: summary || '',
       verified: false,
-      createdAt: Date.now()
+      profileComplete: false,
+      workingHours: '',
+      social: { website: '', instagram: '', facebook: '' },
+      chipOrder: ['location', 'phone', 'email', 'hours'],
+      createdAt: Date.now(),
+      reviewStatus: 'pending',
+      reviewNote: ''
     };
 
     await ddb.put({
@@ -561,6 +715,8 @@ router.get('/verify-email-change', async (req, res) => {
     };
     delete newItem.pendingEmail;
     delete newItem.pendingEmailRequestedAt;
+    delete newItem.emailChangeCodeHash;
+    delete newItem.emailChangeCodeExpiresAt;
 
     await ddb.put({
       TableName: NGO_TABLE,
@@ -580,7 +736,163 @@ router.get('/verify-email-change', async (req, res) => {
   }
 });
 
-// Login NGO (email/password)
+/* --------- NEW: code-based email change endpoints to match UI --------- */
+/**
+ * POST /auth/email/change/request
+ * Body: { newEmail }
+ * Auth: NGO JWT required
+ * Effect: store bcrypt(code), pendingEmail, expiry (10m). Send code to newEmail.
+ */
+router.post('/auth/email/change/request', authenticateJWT, async (req, res) => {
+  try {
+    if (req.user.role !== 'ngo') return res.status(403).json({ error: 'Forbidden.' });
+    const currentEmail = (req.user.email || '').toLowerCase();
+
+    const newEmailRaw = (req.body?.newEmail || '').trim().toLowerCase();
+    if (!newEmailRaw) return res.status(400).json({ error: 'newEmail required' });
+    if (newEmailRaw === currentEmail) return res.status(400).json({ error: 'New email equals current email.' });
+
+    // ensure new email not taken
+    const newExists = await ddb.get({ TableName: NGO_TABLE, Key: { email: newEmailRaw } }).promise();
+    if (newExists.Item) return res.status(409).json({ error: 'Email already in use.' });
+
+    // generate and hash code
+    const code = generate6DigitCode();
+    const codeHash = await bcrypt.hash(code, 10);
+    const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
+
+    await ddb.update({
+      TableName: NGO_TABLE,
+      Key: { email: currentEmail },
+      UpdateExpression: 'SET pendingEmail = :pe, pendingEmailRequestedAt = :t, emailChangeCodeHash = :ch, emailChangeCodeExpiresAt = :exp',
+      ExpressionAttributeValues: {
+        ':pe': newEmailRaw,
+        ':t': Date.now(),
+        ':ch': codeHash,
+        ':exp': expiresAt
+      }
+    }).promise();
+
+    try {
+      await sendEmailChangeCode(newEmailRaw, code);
+    } catch (e) {
+      console.error('[email change] send code failed:', e);
+      // rollback
+      await ddb.update({
+        TableName: NGO_TABLE,
+        Key: { email: currentEmail },
+        UpdateExpression: 'REMOVE pendingEmail, pendingEmailRequestedAt, emailChangeCodeHash, emailChangeCodeExpiresAt'
+      }).promise();
+      return res.status(500).json({ error: 'Failed to send verification code.' });
+    }
+
+    return res.status(200).json({ status: 'code_sent' });
+  } catch (err) {
+    console.error('[email change request] error:', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+/**
+ * POST /auth/email/change/confirm
+ * Body: { code }
+ * Auth: optional. If JWT present, we check that record first; else we scan for matching code.
+ * On success: move item to new email key (like link flow), cleanup temp fields.
+ */
+router.post('/auth/email/change/confirm', async (req, res) => {
+  const code = String(req.body?.code || '').trim();
+  if (!code) return res.status(400).json({ error: 'Code required.' });
+
+  try {
+    const now = Date.now();
+
+    async function finalizeChange(item) {
+      const oldKey = (item.email || '').toLowerCase();
+      const newKey = (item.pendingEmail || '').toLowerCase();
+      if (!newKey) return res.status(400).json({ error: 'No pending email found.' });
+
+      // ensure not taken (race)
+      const taken = await ddb.get({ TableName: NGO_TABLE, Key: { email: newKey } }).promise();
+      if (taken.Item) return res.status(409).json({ error: 'Email already in use.' });
+
+      const newItem = {
+        ...item,
+        email: newKey,
+        verified: true,
+        previousEmail: oldKey
+      };
+      delete newItem.pendingEmail;
+      delete newItem.pendingEmailRequestedAt;
+      delete newItem.emailChangeCodeHash;
+      delete newItem.emailChangeCodeExpiresAt;
+
+      await ddb.put({
+        TableName: NGO_TABLE,
+        Item: newItem,
+        ConditionExpression: 'attribute_not_exists(email)'
+      }).promise();
+
+      await ddb.delete({
+        TableName: NGO_TABLE,
+        Key: { email: oldKey }
+      }).promise();
+
+      return res.status(200).json({ status: 'email_changed' });
+    }
+
+    // First: if JWT present, try the caller (fast path)
+    let bearer = (req.get('authorization') || '').split(' ')[1] || '';
+    if (bearer) {
+      try {
+        const user = jwt.verify(bearer, JWT_SECRET);
+        if (user?.role === 'ngo' && user?.email) {
+          const out = await ddb.get({
+            TableName: NGO_TABLE,
+            Key: { email: (user.email || '').toLowerCase() }
+          }).promise();
+          const Item = out.Item;
+          if (Item?.emailChangeCodeHash && Item?.emailChangeCodeExpiresAt) {
+            if (Item.emailChangeCodeExpiresAt < now) {
+              return res.status(400).json({ error: 'Code expired.' });
+            }
+            const ok = await bcrypt.compare(code, Item.emailChangeCodeHash);
+            if (!ok) return res.status(400).json({ error: 'Invalid code.' });
+            return await finalizeChange(Item);
+          }
+        }
+      } catch (_) { /* ignore and fallback to scan */ }
+    }
+
+    // Fallback: scan table for any pending item
+    let ExclusiveStartKey;
+    while (true) {
+      const page = await ddb.scan({
+        TableName: NGO_TABLE,
+        FilterExpression: 'attribute_exists(emailChangeCodeHash) AND attribute_exists(pendingEmail)',
+        ExclusiveStartKey
+      }).promise();
+
+      for (const item of (page.Items || [])) {
+        if (item.emailChangeCodeExpiresAt && item.emailChangeCodeExpiresAt < now) continue;
+        if (!item.emailChangeCodeHash) continue;
+        const match = await bcrypt.compare(code, item.emailChangeCodeHash);
+        if (match) {
+          return await finalizeChange(item);
+        }
+      }
+
+      ExclusiveStartKey = page.LastEvaluatedKey;
+      if (!ExclusiveStartKey) break;
+    }
+
+    return res.status(400).json({ error: 'Invalid or expired code.' });
+  } catch (err) {
+    console.error('[email change confirm] error:', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+/* ---------------- Login ---------------- */
 router.post('/login', async (req, res) => {
   const { identifier, password } = req.body;
   if (!identifier || !password) {
@@ -608,6 +920,14 @@ router.post('/login', async (req, res) => {
     if (!ngo) return res.status(401).json({ error: 'Invalid credentials.' });
     if (!ngo.verified) return res.status(401).json({ error: 'Email not verified.' });
 
+    // Admin screening gate
+    if (ngo.reviewStatus !== 'approved') {
+      if (ngo.reviewStatus === 'rejected') {
+        return res.status(403).json({ error: 'Application rejected by admin.', note: ngo.reviewNote || '' });
+      }
+      return res.status(403).json({ error: 'Awaiting admin approval.' });
+    }
+
     const match = await bcrypt.compare(password, ngo.passwordHash || '');
     if (!match) return res.status(401).json({ error: 'Invalid credentials.' });
 
@@ -628,8 +948,8 @@ router.post('/login', async (req, res) => {
         location: ngo.location,
         logoUrl: ensuredLogo,
         verified: !!ngo.verified
-      } , needsOnboarding: !isProfileComplete(ngo)  // ← NEW
-
+      },
+      needsOnboarding: !isProfileComplete(ngo)
     });
   } catch (err) {
     console.error('[NGO][LOGIN] ERROR:', err);
@@ -641,14 +961,14 @@ router.post('/login', async (req, res) => {
 router.get('/me', authenticateJWT, async (req, res) => {
   if (req.user.role !== 'ngo') return res.status(403).json({ error: 'Forbidden.' });
   try {
-    const { Item } = await ddb.get({
+    const out = await ddb.get({
       TableName: NGO_TABLE,
       Key: { email: (req.user.email || '').toLowerCase() }
     }).promise();
 
-    if (!Item) return res.status(401).json({ error: 'Invalid session.' });
-    const ensuredLogo = await ensureLogoUrl(Item);
-    res.json({ profile: { ...Item, logoUrl: ensuredLogo } });
+    if (!out.Item) return res.status(401).json({ error: 'Invalid session.' });
+    const ensuredLogo = await ensureLogoUrl(out.Item);
+    res.json({ profile: { ...out.Item, logoUrl: ensuredLogo } });
   } catch (err) {
     console.error('Error fetching profile:', err);
     res.status(500).json({ error: 'Server error.' });
@@ -668,14 +988,18 @@ router.patch('/me', authenticateJWT, async (req, res) => {
       summary,
       logoUrl,
       coordinates,
+      // NEW fields supported by the UI
+      workingHours,
+      social,
+      chipOrder
     } = req.body;
 
     const currentEmail = (req.user.email || '').toLowerCase();
 
     if (email && email.toLowerCase() !== currentEmail) {
       const desired = email.toLowerCase();
-      const { Item: exists } = await ddb.get({ TableName: NGO_TABLE, Key: { email: desired } }).promise();
-      if (exists) return res.status(409).json({ error: 'Email already in use.' });
+      const exists = await ddb.get({ TableName: NGO_TABLE, Key: { email: desired } }).promise();
+      if (exists.Item) return res.status(409).json({ error: 'Email already in use.' });
 
       await ddb.update({
         TableName: NGO_TABLE,
@@ -710,6 +1034,20 @@ router.patch('/me', authenticateJWT, async (req, res) => {
       updateFields.summary = summary;
       updateFields.bio = summary;
     }
+    // NEW: optional UI fields
+    if (workingHours !== undefined) updateFields.workingHours = String(workingHours || '');
+    if (social !== undefined) {
+      const safeSocial = {
+        website: social?.website || '',
+        instagram: social?.instagram || '',
+        facebook: social?.facebook || ''
+      };
+      updateFields.social = safeSocial;
+    }
+    if (Array.isArray(chipOrder) && chipOrder.length) {
+      updateFields.chipOrder = chipOrder.slice(0, 6);
+    }
+
     if (location !== undefined || coordinates !== undefined) {
       const current = await ddb.get({
         TableName: NGO_TABLE,
@@ -737,7 +1075,7 @@ router.patch('/me', authenticateJWT, async (req, res) => {
       exprNames[`#${k}`] = k;
     }
 
-    const { Attributes } = await ddb.update({
+    const updated = await ddb.update({
       TableName: NGO_TABLE,
       Key: { email: currentEmail },
       UpdateExpression: 'SET ' + setParts.join(', '),
@@ -745,7 +1083,9 @@ router.patch('/me', authenticateJWT, async (req, res) => {
       ExpressionAttributeValues: exprVals,
       ReturnValues: 'ALL_NEW'
     }).promise();
-    // NEW: mark profileComplete if they now have location + coordinates
+    const Attributes = updated.Attributes;
+
+    // mark profileComplete if they now have location + coordinates
     const complete = isProfileComplete(Attributes);
     if ((Attributes.profileComplete || false) !== complete) {
       await ddb.update({
@@ -825,7 +1165,7 @@ router.put('/update/:id', authenticateJWT, upload.single('logo'), async (req, re
 router.delete('/delete/:id', authenticateJWT, async (req, res) => {
   const ngoId = req.params.id;
   if (req.user.role !== 'ngo' || req.user.id !== ngoId) {
-    return res.status(403).json({ error: 'Forbidden. You can only delete your own NGO.' });
+    return res.status(403).json({ error: 'Forbidden. You can only update your own NGO.' });
   }
 
   try {

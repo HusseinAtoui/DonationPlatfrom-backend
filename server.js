@@ -23,7 +23,7 @@ app.use('/api/home', home);
 app.use('/api/map', map)
 app.use('/api/messages', messaging);
 app.get("/", (req, res) => {
-  res.send("✅ Backend is running!");
+  res.send("✅ ningmewo!");
 });
 
 // error handler

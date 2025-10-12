@@ -7,6 +7,7 @@ const { authenticateJWT } = require('../middleware/auth');
 const { authorizeRoles } = require('../middleware/authorize');
 require('dotenv').config();
 
+/* ===== AWS SDK v2 setup ===== */
 AWS.config.update({
   region: process.env.AWS_REGION,
   accessKeyId: process.env.AWS_ACCESS_KEY_ID,
@@ -16,6 +17,7 @@ AWS.config.update({
 const ddb = new AWS.DynamoDB.DocumentClient();
 const s3  = new AWS.S3();
 
+/* ===== Config ===== */
 const POSTS_TABLE    = process.env.POSTS_TABLE;
 const REQUESTS_TABLE = process.env.REQUESTS_TABLE;
 const IMAGES_BUCKET  = process.env.LOGOS_BUCKET;
@@ -37,7 +39,8 @@ async function uploadImagesToS3(files) {
       ContentType: file.mimetype,
     };
     const out = await s3.upload(params).promise();
-    return out.Location; // public URL only if bucket policy allows
+    // Note: out.Location is public ONLY if bucket policy (or ACLs) allow GetObject.
+    return out.Location;
   });
   return Promise.all(uploads);
 }
@@ -707,33 +710,32 @@ router.patch(
       const idx = index;
       const q   = Number(acceptance.quantity || 0);
 
-   await ddb.update({
-  TableName: REQUESTS_TABLE,
-  Key: { [REQUESTS_PK]: request[REQUESTS_PK] },
-  UpdateExpression: `
-    SET #acc[${idx}].#aStatus = :cancelled,
-        #acc[${idx}].updatedAt = :now,
-        pledgedCount = if_not_exists(pledgedCount,:z) - :q,
-        updatedAt = :now
-  `,
-  ConditionExpression: `
-    #acc[${idx}].#aStatus <> :received AND
-    #acc[${idx}].#aStatus <> :cancelled AND
-    attribute_exists(pledgedCount) AND pledgedCount >= :q
-  `,
-  ExpressionAttributeNames: {
-    '#acc': 'acceptances',
-    '#aStatus': 'status',  // nested status alias (fix!)
-  },
-  ExpressionAttributeValues: {
-    ':cancelled': 'cancelled',
-    ':received': 'received',
-    ':z': 0,
-    ':q': q,
-    ':now': now
-  }
-}).promise();
-
+      await ddb.update({
+        TableName: REQUESTS_TABLE,
+        Key: { [REQUESTS_PK]: request[REQUESTS_PK] },
+        UpdateExpression: `
+          SET #acc[${idx}].#aStatus = :cancelled,
+              #acc[${idx}].updatedAt = :now,
+              pledgedCount = if_not_exists(pledgedCount,:z) - :q,
+              updatedAt = :now
+        `,
+        ConditionExpression: `
+          #acc[${idx}].#aStatus <> :received AND
+          #acc[${idx}].#aStatus <> :cancelled AND
+          attribute_exists(pledgedCount) AND pledgedCount >= :q
+        `,
+        ExpressionAttributeNames: {
+          '#acc': 'acceptances',
+          '#aStatus': 'status', // nested status alias
+        },
+        ExpressionAttributeValues: {
+          ':cancelled': 'cancelled',
+          ':received': 'received',
+          ':z': 0,
+          ':q': q,
+          ':now': now
+        }
+      }).promise();
 
       res.json({ status: 'cancelled' });
     } catch (e) {
@@ -742,6 +744,8 @@ router.patch(
     }
   }
 );
+
+// PATCH /acceptances/:id/receive (owner NGO)
 router.patch(
   '/acceptances/:id/receive',
   authenticateJWT,
