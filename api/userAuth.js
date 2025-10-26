@@ -613,5 +613,81 @@ router.get(
     }
   }
 );
+// === Forgot password (Donor/User) ===
+router.post('/forgot-password', async (req, res) => {
+  try {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    if (!email) return res.status(400).json({ error: 'Email required.' });
+
+    const user = await getUserByEmail(email);
+    if (!user) return res.status(404).json({ error: 'No account with that email.' });
+
+    const token = require('crypto').randomBytes(24).toString('hex');
+
+    await ddb.update({
+      TableName: USER_TABLE,
+      Key: { email },
+      UpdateExpression: 'SET resetToken = :tk, resetTokenExpires = :exp',
+      ExpressionAttributeValues: {
+        ':tk': token,
+        ':exp': Date.now() + 30 * 60 * 1000, // 30 minutes
+      },
+    }).promise();
+
+    // Important: route back to your frontend login with actor=user
+    const link = `${FRONTEND_URL}/login?token=${encodeURIComponent(token)}&actor=user`;
+    await transporter.sendMail({
+      to: email,
+      from: `"TyebeTyebak" <${process.env.EMAIL_RECEIVER}>`,
+      subject: 'Password reset',
+      html: `<p>Click <a href="${link}">here</a> to reset your password (valid for 30 minutes).</p>`,
+    });
+
+    return res.json({ ok: true, message: 'Reset email sent.' });
+  } catch (err) {
+    console.error('[user/forgot-password] Error:', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// === Reset password (Donor/User) ===
+router.post('/reset-password', async (req, res) => {
+  try {
+    const { token, password } = req.body || {};
+    if (!token || !password) return res.status(400).json({ error: 'Missing token or password.' });
+
+    // (Optional: add a GSI on resetToken to avoid this scan.)
+    let hit = null, ExclusiveStartKey;
+    while (true) {
+      const page = await ddb.scan({
+        TableName: USER_TABLE,
+        FilterExpression: '#rt = :t',
+        ExpressionAttributeNames: { '#rt': 'resetToken' },
+        ExpressionAttributeValues: { ':t': token },
+        ExclusiveStartKey,
+      }).promise();
+      if (page.Items?.length) { hit = page.Items[0]; break; }
+      if (!page.LastEvaluatedKey) break;
+      ExclusiveStartKey = page.LastEvaluatedKey;
+    }
+
+    if (!hit || !hit.resetTokenExpires || hit.resetTokenExpires < Date.now()) {
+      return res.status(400).json({ error: 'Token invalid or expired.' });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    await ddb.update({
+      TableName: USER_TABLE,
+      Key: { email: hit.email },
+      UpdateExpression: 'SET passwordHash = :ph REMOVE resetToken, resetTokenExpires',
+      ExpressionAttributeValues: { ':ph': passwordHash },
+    }).promise();
+
+    return res.json({ ok: true, message: 'Password reset successful.' });
+  } catch (err) {
+    console.error('[user/reset-password] Error:', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
 
 module.exports = router;

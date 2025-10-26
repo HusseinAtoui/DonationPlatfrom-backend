@@ -304,7 +304,7 @@ router.get('/conversations', authenticateJWT, async (req, res) => {
   }
 });
 
-// Unread total for the current actor (for MessageIcon)
+// Unread total for the current actor
 router.get('/conversations/unread-count', authenticateJWT, async (req, res) => {
   try {
     const actor = actorFromReq(req);
@@ -481,7 +481,7 @@ router.post('/conversations/:id/read', authenticateJWT, async (req, res) => {
   }
 });
 
-// Pre-sign S3 upload (v2)
+// Pre-sign S3 upload (v2, no ACL header to match new FE flow)
 router.post('/attachments/presign', authenticateJWT, async (req, res) => {
   try {
     const actor = actorFromReq(req);
@@ -500,11 +500,11 @@ router.post('/attachments/presign', authenticateJWT, async (req, res) => {
     const safeName = String(filename).replace(/[^\w.\-()+@ ]+/g, '_');
     const key = `conversations/${conversationId}/${uuidv4()}-${safeName}`;
 
+    // NOTE: no ACL: 'public-read' per the new flow; ensure your bucket policy allows GET if you need public access.
     const uploadUrl = await s3.getSignedUrlPromise('putObject', {
       Bucket: MESSAGES_BUCKET,
       Key: key,
       ContentType: contentType,
-      ACL: 'public-read',
       Expires: 60 * 5,
     });
 
@@ -516,7 +516,7 @@ router.post('/attachments/presign', authenticateJWT, async (req, res) => {
 
     res.json({
       uploadUrl,
-      requiredHeaders: { 'Content-Type': contentType, 'x-amz-acl': 'public-read' },
+      requiredHeaders: { 'Content-Type': contentType }, // no x-amz-acl header now
       file: { key, url: publicUrl, contentType }
     });
   } catch (err) {

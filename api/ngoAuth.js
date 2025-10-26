@@ -10,6 +10,7 @@ const { authenticateJWT } = require('../middleware/auth');
 const multer = require('multer');
 const passport = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
+const crypto = require('crypto');
 
 require('dotenv').config();
 
@@ -62,33 +63,54 @@ const transporter = nodemailer.createTransport({
 });
 
 /* ---------------- Avatar helpers ---------------- */
+/* CHANGED: Only this block is modified to force a branded green background and two-letter initials */
+const LOGO_BG_COLOR   = process.env.LOGO_BG_COLOR   || '#16a34a'; // brand green
+const LOGO_TEXT_COLOR = process.env.LOGO_TEXT_COLOR || '#ffffff'; // white
+
 function initialsFromName(name = '') {
+  // Force two-letter initials:
+  // - If multiple words: first letter of first and last words
+  // - If single word: first two letters
   const parts = String(name).trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return 'NG';
+  if (parts.length === 1) {
+    const w = parts[0];
+    const a = w[0] || '';
+    const b = w[1] || '';
+    return (a + b).toUpperCase();
+  }
   const first = parts[0]?.[0] || '';
-  const last  = parts.length > 1 ? parts[parts.length - 1][0] : (parts[0]?.[1] || '');
+  const last  = parts[parts.length - 1]?.[0] || '';
   return (first + last).toUpperCase();
 }
+
+// kept for compatibility; no longer used in buildInitialsSVG but not touching callers outside this block
 function colorFromId(id = '') {
   let h = 0;
   for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
   const hue = h % 360;
   return `hsl(${hue} 70% 70%)`;
 }
+
 function buildInitialsSVG({ name, id }) {
+  // Use fixed brand colors and two-letter initials
   const initials = initialsFromName(name || 'NGO');
-  const bg = colorFromId(id || initials);
+  const bg = LOGO_BG_COLOR;
+  const fg = LOGO_TEXT_COLOR;
   return `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
   <circle cx="128" cy="128" r="128" fill="${bg}"/>
   <text x="50%" y="50%" dominant-baseline="central" text-anchor="middle"
-        font-family="Arial, sans-serif" font-size="100" font-weight="bold"
-        fill="#1f2937">${initials}</text>
+        font-family="Arial, Helvetica, sans-serif" font-size="100" font-weight="700"
+        fill="${fg}">${initials}</text>
 </svg>`;
 }
+
 function svgDataUrlFor({ id, name }) {
   const svg = buildInitialsSVG({ id, name });
   return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
 }
+
 async function uploadDefaultAvatar({ id, name }) {
   const key = `logos/default-${id}.svg`;
   const svg = buildInitialsSVG({ name, id });
@@ -101,6 +123,7 @@ async function uploadDefaultAvatar({ id, name }) {
   const out = await s3.upload(params).promise();
   return out.Location;
 }
+
 async function ensureLogoUrl(ngo) {
   if (ngo.logoUrl) return ngo.logoUrl;
   if (LOGOS_BUCKET) {
@@ -119,6 +142,7 @@ async function ensureLogoUrl(ngo) {
   }
   return svgDataUrlFor({ id: ngo.id, name: ngo.name });
 }
+
 function isProfileComplete(ngo) {
   const locOk = typeof ngo.location === 'string' && ngo.location.trim().length > 0;
   const latOk = ngo?.coordinates && typeof ngo.coordinates.lat === 'number';
@@ -163,6 +187,51 @@ async function sendEmailChangeCode(newEmail, code) {
     subject: 'Your verification code',
     text: `Your verification code is: ${code}\nIt expires in 10 minutes.`
   });
+}
+
+/* -------- NGO helpers for password reset (used below) -------- */
+async function getNGOByEmail(rawEmail) {
+  const email = String(rawEmail || '').trim().toLowerCase();
+  if (!email) return null;
+  const { Item } = await ddb.get({ TableName: NGO_TABLE, Key: { email } }).promise();
+  return Item || null;
+}
+async function updateNGO(email, attrs) {
+  const keyEmail = String(email || '').trim().toLowerCase();
+  if (!keyEmail) throw new Error('updateNGO: email required');
+  const sets = [];
+  const names = {};
+  const values = {};
+  for (const [k, v] of Object.entries(attrs || {})) {
+    sets.push(`#${k} = :${k}`);
+    names[`#${k}`] = k;
+    values[`:${k}`] = v;
+  }
+  if (!sets.length) return;
+  await ddb.update({
+    TableName: NGO_TABLE,
+    Key: { email: keyEmail },
+    UpdateExpression: `SET ${sets.join(', ')}`,
+    ExpressionAttributeNames: names,
+    ExpressionAttributeValues: values,
+  }).promise();
+}
+/** Consider adding a GSI on resetToken to avoid scanning. */
+async function findNGOByResetToken(token) {
+  let ExclusiveStartKey;
+  while (true) {
+    const page = await ddb.scan({
+      TableName: NGO_TABLE,
+      FilterExpression: '#rt = :t',
+      ExpressionAttributeNames: { '#rt': 'resetToken' },
+      ExpressionAttributeValues: { ':t': token },
+      ExclusiveStartKey,
+    }).promise();
+    if (page.Items?.length) return page.Items[0];
+    if (!page.LastEvaluatedKey) break;
+    ExclusiveStartKey = page.LastEvaluatedKey;
+  }
+  return null;
 }
 
 /* ---------------- Google OAuth (two-intent) ---------------- */
@@ -468,7 +537,6 @@ function requireAdmin(req, res, next) {
 }
 
 /* === ADMIN ROUTES === */
-// Login as admin: returns JWT with role=admin
 router.post('/admin/login', async (req, res) => {
   try {
     const { email, password } = req.body || {};
@@ -495,12 +563,11 @@ router.post('/admin/login', async (req, res) => {
     );
     return res.json({ token, user: { role: 'admin', email: emailNorm } });
   } catch (err) {
-    console.error('[ADMIN][LOGIN] ERROR:', err);
+    console.error('[ADMIN][LOGIN] ERROR]:', err);
     return res.status(500).json({ error: 'Server error.' });
   }
 });
 
-// List NGOs pending review
 router.get('/admin/ngos/pending',
   authenticateJWT,
   requireAdmin,
@@ -520,7 +587,6 @@ router.get('/admin/ngos/pending',
   }
 );
 
-// Approve an NGO (by email key)
 router.post('/admin/ngos/:email/approve',
   authenticateJWT,
   requireAdmin,
@@ -541,7 +607,6 @@ router.post('/admin/ngos/:email/approve',
   }
 );
 
-// Reject an NGO (by email key)
 router.post('/admin/ngos/:email/reject',
   authenticateJWT,
   requireAdmin,
@@ -564,7 +629,6 @@ router.post('/admin/ngos/:email/reject',
 
 /* ---------------- REST: NGO endpoints (kept) ---------------- */
 
-// List NGOs
 router.get('/ngos', async (_req, res) => {
   try {
     const data = await ddb.scan({ TableName: NGO_TABLE }).promise();
@@ -575,7 +639,6 @@ router.get('/ngos', async (_req, res) => {
   }
 });
 
-// Create NGO (email/password flow)
 router.post('/create', upload.single('logo'), async (req, res) => {
   let {
     email, phone, name, location, password,
@@ -662,7 +725,6 @@ router.post('/create', upload.single('logo'), async (req, res) => {
   }
 });
 
-// Verify route (GET /api/ngo/verify?token=...)
 router.get('/verify', async (req, res) => {
   const token = req.query.token;
   if (!token) return res.status(400).json({ error: 'Token required.' });
@@ -683,7 +745,6 @@ router.get('/verify', async (req, res) => {
   }
 });
 
-// Verify email change (GET /api/ngo/verify-email-change?token=...)
 router.get('/verify-email-change', async (req, res) => {
   const token = req.query.token;
   if (!token) return res.status(400).json({ error: 'Token required.' });
@@ -737,12 +798,6 @@ router.get('/verify-email-change', async (req, res) => {
 });
 
 /* --------- NEW: code-based email change endpoints to match UI --------- */
-/**
- * POST /auth/email/change/request
- * Body: { newEmail }
- * Auth: NGO JWT required
- * Effect: store bcrypt(code), pendingEmail, expiry (10m). Send code to newEmail.
- */
 router.post('/auth/email/change/request', authenticateJWT, async (req, res) => {
   try {
     if (req.user.role !== 'ngo') return res.status(403).json({ error: 'Forbidden.' });
@@ -793,12 +848,6 @@ router.post('/auth/email/change/request', authenticateJWT, async (req, res) => {
   }
 });
 
-/**
- * POST /auth/email/change/confirm
- * Body: { code }
- * Auth: optional. If JWT present, we check that record first; else we scan for matching code.
- * On success: move item to new email key (like link flow), cleanup temp fields.
- */
 router.post('/auth/email/change/confirm', async (req, res) => {
   const code = String(req.body?.code || '').trim();
   if (!code) return res.status(400).json({ error: 'Code required.' });
@@ -1161,7 +1210,55 @@ router.put('/update/:id', authenticateJWT, upload.single('logo'), async (req, re
   }
 });
 
-// Delete (by id)
+/* === Forgot password (request link) === */
+router.post('/forgot-password', async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'Email required.' });
+
+  const item = await getNGOByEmail(email);
+  if (!item) return res.status(404).json({ error: 'No account with that email.' });
+
+  const token = crypto.randomBytes(24).toString('hex');
+  // IMPORTANT: route back to frontend login with an actor hint
+  const link = `${FRONTEND_URL}/login?token=${encodeURIComponent(token)}&actor=ngo`;
+
+  // Save token + expiry to the record
+  await updateNGO(item.email, {
+    resetToken: token,
+    resetTokenExpires: Date.now() + 1000 * 60 * 30, // 30 min
+  });
+
+  await transporter.sendMail({
+    to: email,
+    from: `"TyebeTyebak" <${process.env.EMAIL_RECEIVER}>`,
+    subject: 'Password reset',
+    html: `<p>Click <a href="${link}">here</a> to reset your password (valid for 30 minutes).</p>`,
+  });
+
+  res.json({ ok: true, message: 'Reset email sent.' });
+});
+
+/* === Reset password (submit new) === */
+router.post('/reset-password', async (req, res) => {
+  const { token, password } = req.body;
+  if (!token || !password) return res.status(400).json({ error: 'Missing token or password.' });
+
+  const ngo = await findNGOByResetToken(token);
+  if (!ngo || ngo.resetTokenExpires < Date.now()) {
+    return res.status(400).json({ error: 'Token invalid or expired.' });
+  }
+
+  const hash = await bcrypt.hash(password, 10);
+  await updateNGO(ngo.email, {
+    passwordHash: hash,
+    resetToken: null,
+    resetTokenExpires: null,
+  });
+
+  res.json({ ok: true, message: 'Password reset successful.' });
+});
+
+/* === Delete (by id) === */
 router.delete('/delete/:id', authenticateJWT, async (req, res) => {
   const ngoId = req.params.id;
   if (req.user.role !== 'ngo' || req.user.id !== ngoId) {
@@ -1182,7 +1279,7 @@ router.delete('/delete/:id', authenticateJWT, async (req, res) => {
   }
 });
 
-// Delete — self
+/* === Delete — self === */
 router.delete('/me', authenticateJWT, async (req, res) => {
   if (req.user.role !== 'ngo') return res.status(403).json({ error: 'Forbidden.' });
 
@@ -1200,7 +1297,7 @@ router.delete('/me', authenticateJWT, async (req, res) => {
   }
 });
 
-// Public profile minimal
+/* === Public profile minimal === */
 router.get('/public/:id', async (req, res) => {
   const id = req.params.id;
   if (!id) return res.status(400).json({ error: 'id required' });

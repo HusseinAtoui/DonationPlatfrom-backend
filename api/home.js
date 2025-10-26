@@ -744,7 +744,6 @@ router.patch(
     }
   }
 );
-
 // PATCH /acceptances/:id/receive (owner NGO)
 router.patch(
   '/acceptances/:id/receive',
